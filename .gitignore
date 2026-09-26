@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+caro_run/
+caro_selftest/
+emowoz_data/
