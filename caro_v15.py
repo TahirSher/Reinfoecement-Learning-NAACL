@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CARO v14 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
+"""CARO v15 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
 
 Stages: sft -> simulator -> validate -> corpus -> reward -> train -> eval -> report  (or `all`),
 then analysis (ablations, sensitivity, length analysis, external evaluator, claims, LaTeX), and
@@ -12,6 +12,32 @@ simulator scores counterfactual agent responses by the affect of the customer re
 expected to elicit, a reward model is fitted to those counterfactual outcomes, and the agent is
 optimised against it with GRPO.  The target is emotional appropriateness WITHOUT loss of task
 information, so information retention is measured and tested for non-inferiority.
+
+What changed from v14 (all prompted by the failed v14 validate run; stages 3+ must be re-run):
+  V1  Root cause of the failure.  With --outcome-mode auto and no outcome_mode.json in the run
+      directory, v14 SILENTLY used the Monte Carlo ("sample") estimator.  Re-running that estimator on
+      the same responses flipped 34.6% of within-context pairs (the replication null), so the flip
+      ceiling of 10% could not be met whatever the length behaviour: the TOST passed, tau_corrected
+      was 0, and pure length flipped FEWER pairs (17.0%) than noise did.  The validate stage now selects
+      the estimator itself (TRAIN-split data only) and nothing falls back silently.
+  V2  Estimator selection requires determinism.  The deterministic panel expectation is selected
+      whenever its human anchor CI excludes zero; v14 maximised the anchor alone, which cannot see that
+      a noisy estimator is unusable for within-context ranking.  This CHANGES the pre-registered
+      selection rule; report the change and the reason (V1) in the paper.
+  V3  Affect-neutral filler banks.  The courtesy bank used to train the simulator and to fit h(L)
+      measured sentiment +0.42: fitting a "pure-length" correction on it conflates length with affect,
+      and training the simulator to IGNORE courtesy tails removes part of the signal CARO rewards.
+      New runs use three disjoint neutral banks (train / calib / heldout, one role each); simulators
+      trained on the old bank are recognised (simulator_meta.json) and flagged for retraining.
+  V4  Stability-constrained panel temperature.  T maximises the calibration anchor subject to a
+      FIT-half flip rate <= 0.8 x the ceiling (after h(L)), inside both the cross-fitted projector
+      probe and the final freeze.  Only FIT-half data enter; the gate is untouched.
+  V5  One simulator load in validate (v14 loaded the 3B model twice to build the panel); the adapter is
+      loaded into the live LoRA modules instead of stacking a second PeftModel.
+  V6  Attribution: a sampled estimator whose replication null exceeds the length contrast is
+      reported as Monte Carlo noise, not as "surface brittleness".
+None of these changes relaxes a threshold.  If the gate still fails with the deterministic estimator,
+the failure is real and must be reported.
 
 What changed from v13 (each item names the reviewer finding it answers; the stage that has to be
 re-run is in brackets):
@@ -229,9 +255,47 @@ HELDOUT_TAILS = (
 )
 HELDOUT_HEADS = ("Okay.", "Right.", "I see.", "Understood.", "Noted.", "Alright.")
 
-FILLER_BANKS = {"train": (NEUTRAL_TAILS, NEUTRAL_HEADS), "heldout": (HELDOUT_TAILS, HELDOUT_HEADS)}
-VERSION = "v14"
-COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14")   # stage-3/4/5 artefacts from v9 onwards remain valid
+# v15: the v8-v14 "train" bank above is NOT affect-neutral: the validate log measures its mean sentiment at
+# +0.42 (held-out bank +0.08), because it is made of courtesy phrases ("I hope that helps", "happy to
+# help").  Two consequences.  (i) Fitting h(L) and the projector on it confounds length with affect: the
+# fitted "pure-length" curve also absorbs the effect of added courtesy.  (ii) Training the simulator to be
+# INVARIANT to courtesy tails teaches it to ignore exactly the emotional wording this work is about.  The
+# bank is kept, renamed courtesy_v13, only so that simulators trained on it can still be analysed; new
+# runs use three disjoint affect-neutral banks with one role each:
+#   train    simulator invariance regularisation (stage 2)
+#   calib    every FITTED correction: h(L), the logit projector, the panel temperature constraint,
+#            orbit averaging and the reward's counterfactual logit pairing
+#   heldout  every GATE (simulator validation, reward padding TOST); never seen by any fit
+TRAIN_TAILS = (
+    "That is what the booking system lists.",
+    "Those details are from the current timetable.",
+    "This matches the entry in the database.",
+    "The listing was last updated this week.",
+    "I have entered that into the system.",
+    "The record shows the same details.",
+    "That is the entry on file for this.",
+    "Those figures come from the provider.",
+)
+TRAIN_HEADS = ("So.", "Now.", "Well.", "Let me see.", "One moment.", "Checking.")
+CALIB_TAILS = (
+    "These details are taken from the listing.",
+    "That is how it appears on the schedule.",
+    "The system has this recorded.",
+    "This is what the provider has listed.",
+    "The information above is from the database.",
+    "That entry is in the current records.",
+    "These are the details held on file.",
+    "The schedule shows it this way.",
+)
+CALIB_HEADS = ("Ok.", "Yes.", "So then.", "Right then.", "Looking now.", "Here it is.")
+
+FILLER_BANKS = {"courtesy_v13": (NEUTRAL_TAILS, NEUTRAL_HEADS), "train": (TRAIN_TAILS, TRAIN_HEADS),
+                "calib": (CALIB_TAILS, CALIB_HEADS), "heldout": (HELDOUT_TAILS, HELDOUT_HEADS)}
+FIT_BANK = "calib"
+_all_fill = [x for b in FILLER_BANKS.values() for part in b for x in part]
+assert len(_all_fill) == len(set(_all_fill)), "filler banks must be disjoint"
+VERSION = "v15"
+COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15")   # stage-3/4/5 artefacts from v9 onwards remain valid
 
 # Arms that are optimised (need a train stage) versus arms that only re-use the SFT adapter.
 TRAINED_ARMS = ("sentiment_only", "dpo", "caro", "caro_no_abstain")
@@ -769,7 +833,7 @@ class LengthInvarianceAugmenter:
     """Content-free lengthening drawn from ONE filler bank ("train" or "heldout", see FILLER_BANKS)."""
 
     def __init__(self, n_levels: int = 2, seed: int = 0, p_head: float = 0.35, max_words: int = 110,
-                 bank: str = "train"):
+                 bank: str = FIT_BANK):
         if bank not in FILLER_BANKS:
             raise ValueError(f"unknown filler bank {bank!r}; choose from {sorted(FILLER_BANKS)}")
         self.bank = bank
@@ -1372,10 +1436,36 @@ class Policy:
         self.model.save_pretrained(str(path))
 
     def load_adapter(self, path: Path) -> None:
-        from peft import PeftModel
-        base = self.model.get_base_model()
-        self.model = PeftModel.from_pretrained(base, str(path), is_trainable=True)
-        self.logger.info("loaded adapter from %s", path)
+        """Load saved LoRA weights INTO the existing adapter.
+
+        v14 re-wrapped the (already LoRA-injected) base model in a second PeftModel, which is what the
+        peft warning "Already found a peft_config attribute ... multiple adapters" in the logs reports.
+        v15 writes the saved tensors into the live adapter and verifies that every LoRA tensor was
+        matched; if anything does not match (e.g. a different rank) it falls back to the old path."""
+        path = Path(path)
+        try:
+            from peft.utils import set_peft_model_state_dict
+            st = path / "adapter_model.safetensors"
+            if st.exists():
+                from safetensors.torch import load_file
+                sd = load_file(str(st))
+            else:
+                import torch
+                sd = torch.load(str(path / "adapter_model.bin"), map_location="cpu")
+            if not any("lora_" in k for k in sd):
+                raise ValueError("no LoRA tensors in the saved adapter")
+            res = set_peft_model_state_dict(self.model, sd)
+            missing = [k for k in getattr(res, "missing_keys", []) if "lora_" in k]
+            unexpected = list(getattr(res, "unexpected_keys", []))
+            if missing or unexpected:
+                raise ValueError(f"{len(missing)} LoRA tensors missing, {len(unexpected)} unexpected")
+            self.logger.info("loaded adapter from %s (%d tensors into the live adapter)", path, len(sd))
+        except Exception as e:
+            from peft import PeftModel
+            self.logger.warning("in-place adapter load failed (%s); re-wrapping the base model instead", e)
+            base = self.model.get_base_model()
+            self.model = PeftModel.from_pretrained(base, str(path), is_trainable=True)
+            self.logger.info("loaded adapter from %s", path)
 
     def _encode_pairs(self, pairs: Sequence[Tuple[str, str]]):
         import torch
@@ -2045,7 +2135,8 @@ class OutcomePanel:
     def calibrate(self, policy, turns: Sequence[Turn], sentiment, logger: logging.Logger,
                   grid: Sequence[float] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0),
                   projector: Optional["LogitNullspaceProjector"] = None,
-                  quiet: bool = False, cache_file: Optional[Path] = None) -> "OutcomePanel":
+                  quiet: bool = False, cache_file: Optional[Path] = None,
+                  admissible: Optional[Callable[[float], bool]] = None) -> "OutcomePanel":
         """Select the softmax temperature on held-out TRAIN turns.
 
         v9: the (turns x panel) log-probability matrix does not depend on the projector or the
@@ -2080,7 +2171,11 @@ class OutcomePanel:
         self.center = lp.mean(0)
         z0 = lp - self.center[None, :]
         best = (-2.0, float(grid[0]), 0.0)
+        best_any = (-2.0, float(grid[0]), 0.0)
+        n_adm = 0
         for T in grid:
+            ok_T = True if admissible is None else bool(admissible(float(T)))
+            n_adm += int(ok_T)
             zz = z0
             if projector is not None and projector.fitted:
                 zz = projector.apply(z0)
@@ -2090,20 +2185,31 @@ class OutcomePanel:
             w = w / np.maximum(w.sum(1, keepdims=True), EPS)
             r = spearman(w @ self.sent, target)
             ess = float(np.mean(1.0 / np.maximum((w ** 2).sum(1), EPS)))
-            if math.isfinite(r) and r > best[0]:
+            if math.isfinite(r) and r > best_any[0]:
+                best_any = (r, float(T), ess)
+            if ok_T and math.isfinite(r) and r > best[0]:
                 best = (r, float(T), ess)
+        constrained = admissible is not None
+        if constrained and n_adm == 0:
+            logger.warning("no panel temperature on the grid meets the FIT-half stability constraint; using the "
+                           "unconstrained optimum T=%.3g and letting the gate report the consequence", best_any[1])
+            best = best_any
         self.temperature = best[1]
         self.calibration = {"n": len(turns), "rho": best[0], "temperature": best[1],
                             "effective_panel_size": best[2], "panel_size": len(self.texts),
-                            "projector_k": int(projector.k) if (projector is not None and projector.fitted) else 0}
+                            "projector_k": int(projector.k) if (projector is not None and projector.fitted) else 0,
+                            "stability_constrained": constrained, "n_admissible_T": n_adm if constrained else None,
+                            "unconstrained_T": best_any[1], "unconstrained_rho": best_any[0]}
         if best[1] >= max(grid) or best[1] <= min(grid):
             logger.warning("panel temperature T=%.3g sits on the edge of the search grid %s; the optimum may lie "
                            "outside it", best[1], list(grid))
         if not quiet:
             logger.info("panel calibrated on %d held-out TRAIN turns | per-candidate log-probability centring "
                         "removes each candidate's intrinsic length and frequency exactly | T=%.3g gives rho=%.4f "
-                        "against the observed next-customer sentiment | effective panel size %.1f of %d",
-                        len(turns), best[1], best[0], best[2], len(self.texts))
+                        "against the observed next-customer sentiment | effective panel size %.1f of %d%s",
+                        len(turns), best[1], best[0], best[2], len(self.texts),
+                        (f" | stability-constrained ({n_adm}/{len(grid)} temperatures admissible; unconstrained "
+                         f"optimum T={best_any[1]:.3g} rho={best_any[0]:.4f})") if constrained else "")
         if best[2] > 0.8 * len(self.texts):
             logger.warning("the calibrated panel weights are nearly uniform (effective size %.1f of %d): the "
                            "expected-outcome estimator is close to non-responsive and will under-discriminate "
@@ -2228,7 +2334,7 @@ class UserSimulator:
         self.orbit_seed = int(orbit_seed)
 
     def fit(self, train: Sequence[Turn], dev: Sequence[Turn], cfg: SFTConfig, best_dir: Path,
-            augment_levels: int = 2, seed: int = 0) -> Dict[str, Any]:
+            augment_levels: int = 2, seed: int = 0, bank: str = "train") -> Dict[str, Any]:
         src = [t for t in train if t.next_user_text]
         dv = [(customer_prompt(t, t.gold_response), t.next_user_text)
               for t in dev if t.next_user_text][: cfg.dev_examples]
@@ -2236,7 +2342,7 @@ class UserSimulator:
             raise ValueError(f"insufficient simulator data (train={len(src)}, dev={len(dv)})")
 
         def resample(epoch: int) -> List[Tuple[str, str, Optional[str]]]:
-            aug = LengthInvarianceAugmenter(n_levels=augment_levels, seed=seed * 1000 + epoch)
+            aug = LengthInvarianceAugmenter(n_levels=augment_levels, seed=seed * 1000 + epoch, bank=bank)
             items: List[Tuple[str, str, Optional[str]]] = []
             rng = np.random.default_rng(seed * 7919 + epoch)
             for t in src:
@@ -2247,7 +2353,7 @@ class UserSimulator:
             return items
 
         base_w = float(np.mean([len(t.gold_response.split()) for t in src]))
-        a0 = LengthInvarianceAugmenter(n_levels=augment_levels, seed=seed)
+        a0 = LengthInvarianceAugmenter(n_levels=augment_levels, seed=seed, bank=bank)
         top_w = float(np.mean([len(a0.lengthen(t.gold_response, augment_levels).split()) for t in src]))
         self.logger.info("length invariance | %d unique targets held fixed (no duplication); one length rung in "
                          "0..%d resampled per example per epoch | mean agent turn %.1f -> %.1f words at the top "
@@ -2326,7 +2432,7 @@ class UserSimulator:
             if lvl == 0:
                 rs = list(responses)
             else:
-                aug = LengthInvarianceAugmenter(n_levels=lvl, seed=self.orbit_seed + 7919 * lvl, bank="train")
+                aug = LengthInvarianceAugmenter(n_levels=lvl, seed=self.orbit_seed + 7919 * lvl, bank=FIT_BANK)
                 rs = [aug.lengthen(r, lvl) for r in responses]
             acc += self._panel_expectation(turns, rs)
         return acc / float(self.n_orbit)
@@ -2526,7 +2632,13 @@ def intervention_stats(y0: np.ndarray, y1: np.ndarray, y0b: np.ndarray, yA: np.n
     log.info("  rank stability | within-group flip rate: length %.4f, replication null %.4f, "
                     "length-matched surface null %.4f | rule = %s -> %s",
                     flip_perturb, flip_null, flip_surf, flip_rule, "PASS" if flip_ok else "FAIL")
-    if math.isfinite(flip_surf) and math.isfinite(flip_perturb) and not flip_ok:
+    if (not deterministic and math.isfinite(flip_null) and math.isfinite(flip_perturb) and not flip_ok
+            and flip_null >= flip_perturb):
+        log.warning("  attribution: re-running the SAME responses flips %.1f%% of within-context pairs, more "
+                    "than the length contrast (%.1f%%): the failure is the estimator's Monte Carlo noise, not "
+                    "length or surface sensitivity. Use the deterministic panel estimator.",
+                    100 * flip_null, 100 * flip_perturb)
+    elif math.isfinite(flip_surf) and math.isfinite(flip_perturb) and not flip_ok:
         if flip_surf >= 0.6 * flip_perturb:
             log.warning("  attribution: most of the instability survives at MATCHED length -- the "
                                "estimator is surface-brittle rather than length-biased; erasing the length "
@@ -2601,6 +2713,21 @@ def paired_length_intervention(sim: "UserSimulator", turns: Sequence[Turn], resp
 
 def select_outcome_mode(sim: "UserSimulator", turns: Sequence[Turn], logger: logging.Logger,
                         candidates: Sequence[str] = ("sample", "expected")) -> Dict[str, Any]:
+    """Choose the outcome estimator on TRAIN-split labelled turns (never on validation data).
+
+    v15 rule.  The corpus labels are WITHIN-context rankings of counterfactual responses, so the
+    estimator must first of all reproduce its own rankings when re-run on the same responses.  The
+    deterministic panel expectation ("expected") does so by construction; the Monte Carlo estimator
+    ("sample") does not: in the v14 validate run its replication null flipped 34.6% of within-context
+    pairs, 3.5x the pre-registered 10% ceiling, so no invariance gate could pass whatever the length
+    behaviour (tau_corrected was 0 and the TOST passed; only the flip rule failed).  Hence:
+      1. "expected" is selected whenever it is available and its human anchor is positive with a
+         Fisher 95% CI excluding zero;
+      2. otherwise the estimator with the larger human anchor is selected, and a sampled estimator is
+         flagged as unlikely to pass the flip gate.
+    For "sample" the split-half noise (two disjoint halves of the rollouts) is reported, so the
+    choice is documented with the number that motivates it.  v14 maximised the anchor alone.
+    This is a change of the pre-registered selection rule and must be reported as such."""
     turns = [t for t in turns if t.next_user_text and t.human_valence is not None]
     if len(turns) < 100:
         raise ValueError("select_outcome_mode: need >= 100 labelled turns with a next customer turn")
@@ -2608,7 +2735,7 @@ def select_outcome_mode(sim: "UserSimulator", turns: Sequence[Turn], logger: log
     val = np.asarray([t.human_valence for t in turns], float)
     shift_target = (np.asarray(sim.sentiment([t.next_user_text for t in turns]), float)
                     - np.asarray(sim.sentiment([t.user_text for t in turns]), float))
-    keep_mode, keep_cv, keep_lc = sim.mode, sim.control_variate, sim.length_control
+    keep_mode, keep_cv, keep_lc, keep_r = sim.mode, sim.control_variate, sim.length_control, sim.n_rollouts
     sim.control_variate, sim.length_control = None, None
     report: Dict[str, Any] = {}
     try:
@@ -2617,25 +2744,47 @@ def select_outcome_mode(sim: "UserSimulator", turns: Sequence[Turn], logger: log
                 continue
             sim.mode = m
             try:
-                y = sim.outcome(turns, gold, crn_seed=31337)
+                if m == "sample":
+                    sim.n_rollouts = max(1, keep_r // 2)
+                    r1 = sim.raw(turns, gold, crn_seed=31337)
+                    r2 = sim.raw(turns, gold, crn_seed=41337)
+                    sim.n_rollouts = keep_r
+                    y = 0.5 * (r1 + r2) - np.asarray(sim.sentiment([t.user_text for t in turns]), float)
+                    noise_sd = float(np.std(r1 - r2, ddof=1) / 2.0)       # sd of the full-R estimate
+                    extra = {"deterministic": False, "mc_noise_sd": noise_sd,
+                             "split_half_r": pearson(r1, r2)}
+                else:
+                    y = sim.raw(turns, gold, crn_seed=31337) - np.asarray(sim.sentiment([t.user_text for t in turns]), float)
+                    extra = {"deterministic": True, "mc_noise_sd": 0.0, "split_half_r": 1.0}
             except Exception as e:
                 logger.warning("outcome mode '%s' unavailable: %s", m, e)
                 continue
-            report[m] = {"human_anchor_rho": spearman(y, val),
-                         "shift_anchor_rho": spearman(y, shift_target),
-                         "sd": float(np.std(y))}
+            rho = spearman(y, val)
+            report[m] = {"human_anchor_rho": rho, "human_anchor_ci95": list(fisher_ci(rho, len(turns))),
+                         "shift_anchor_rho": spearman(y, shift_target), "sd": float(np.std(y)), **extra}
     finally:
         sim.control_variate, sim.length_control = keep_cv, keep_lc
-        sim.mode = keep_mode
+        sim.mode, sim.n_rollouts = keep_mode, keep_r
     if not report:
         raise RuntimeError("select_outcome_mode: no usable outcome estimator")
-    best = max(report, key=lambda m: (report[m]["human_anchor_rho"]
-                                      if math.isfinite(report[m]["human_anchor_rho"]) else -2.0))
-    logger.info("outcome estimator selection on %d held-out labelled turns (gold responses):", len(turns))
+    ex_ = report.get("expected")
+    if ex_ is not None and math.isfinite(ex_["human_anchor_ci95"][0]) and ex_["human_anchor_ci95"][0] > 0:
+        best, why = "expected", "deterministic and its human anchor CI excludes zero"
+    else:
+        best = max(report, key=lambda m: (report[m]["human_anchor_rho"]
+                                          if math.isfinite(report[m]["human_anchor_rho"]) else -2.0))
+        why = "largest human anchor (the deterministic estimator is unavailable or carries no human signal)"
+    logger.info("outcome estimator selection on %d TRAIN labelled turns (gold responses):", len(turns))
     for m, v in report.items():
-        logger.info("  %-9s | human anchor rho=%+.4f | shift anchor rho=%+.4f | sd=%.4f%s",
-                    m, v["human_anchor_rho"], v["shift_anchor_rho"], v["sd"], "  <- selected" if m == best else "")
+        logger.info("  %-9s | human anchor rho=%+.4f CI95[%+.4f,%+.4f] | shift anchor rho=%+.4f | sd=%.4f | "
+                    "Monte Carlo noise sd=%.4f%s", m, v["human_anchor_rho"], *v["human_anchor_ci95"],
+                    v["shift_anchor_rho"], v["sd"], v["mc_noise_sd"], "  <- selected" if m == best else "")
+    logger.info("  rule: %s", why)
+    if best == "sample":
+        logger.warning("the SAMPLED estimator was selected: its own Monte Carlo noise flips within-context "
+                       "rankings, so the flip gate is expected to fail. Increase --sim-rollouts or fix the panel.")
     report["selected"] = best
+    report["rule"] = why
     return report
 
 
@@ -2732,7 +2881,7 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
 
     bank_sent = {b: float(np.mean(sim.sentiment(list(FILLER_BANKS[b][0]) + list(FILLER_BANKS[b][1]))))
                  for b in FILLER_BANKS}
-    logger.info("filler-bank affect check | mean sentiment of the fillers: %s (both should be near 0)",
+    logger.info("filler-bank affect check | mean sentiment of the fillers: %s (all should be near 0)",
                 ", ".join(f"{k}={v:+.3f}" for k, v in bank_sent.items()))
 
     n_pi = min(len(flat), n_intervention)
@@ -2779,6 +2928,9 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
                         f"surface null [{intervention['flip_rule']}]")
         fails.append(f"paired length intervention failed after adding {intervention['words_added']:.0f} "
                      f"content-free words: " + "; ".join(bits))
+    if abs(bank_sent.get(FIT_BANK, 0.0)) > 0.25:
+        warns.append(f"the {FIT_BANK} filler bank used to FIT h(L) is not affect-neutral (mean "
+                     f"{bank_sent[FIT_BANK]:+.3f}): h(L) then absorbs an affect effect as if it were length")
     if math.isfinite(bank_sent.get(gate_bank, 0.0)) and abs(bank_sent.get(gate_bank, 0.0)) > 0.25:
         warns.append(f"the {gate_bank} filler bank is not affect-neutral under the sentiment model "
                      f"(mean {bank_sent[gate_bank]:+.3f}); the length intervention is then partly an affect "
@@ -2882,7 +3034,7 @@ def build_corpus(turns: Sequence[Turn], proposal, sim: UserSimulator, n_variants
         n_bad += int((~ok).sum())
         # Counterfactual padding pairs, drawn among the SAMPLED variants (never the gold turn).
         prng = np.random.default_rng(crn_base + 13 * s)
-        aug_tr = LengthInvarianceAugmenter(n_levels=1, seed=crn_base + 17 * s, bank="train")
+        aug_tr = LengthInvarianceAugmenter(n_levels=1, seed=crn_base + 17 * s, bank=FIT_BANK)
         aug_ho = LengthInvarianceAugmenter(n_levels=1, seed=crn_base + 19 * s, bank="heldout")
         extra_t, extra_r, pad_src, probe_src = [], [], [], []
         for i, t in enumerate(chunk):
@@ -3860,6 +4012,8 @@ class Config:
     human_validity_pairs: int = 200         # R3: within-context simulator-validity items
     human_overlap: float = 0.3              # R3: share of items annotated twice (for agreement)
     human_comparisons: Tuple[str, ...] = ("caro:sft", "caro:sentiment_only", "caro:dpo")
+    stability_safety: float = 0.8           # v15: FIT-half flip limit = this x max_abs_flip when choosing T (0 = off)
+    sim_train_bank: str = "train"           # v15: filler bank for the simulator's invariance regulariser
     noninferiority_info_margin: float = 0.05   # D4: information-retention non-inferiority margin (recall units)
     cross_eval_contexts: int = 500             # held-out contexts for cross-evaluator agreement
     cross_eval_k: int = 4                      # responses per context (K=4 -> 6 pairs per context)
@@ -3906,22 +4060,23 @@ class Experiment:
     def gen(self, temperature: float = 0.9) -> GenConfig:
         return GenConfig(temperature=temperature)
 
-    def panel(self) -> Optional[OutcomePanel]:
+    def panel(self, policy=None) -> Optional[OutcomePanel]:
         if self.cfg.outcome_mode == "sample":
             return None
         f = self.cfg.out / "outcome_panel.json"
         if f.exists():
             return OutcomePanel.load(load_json(f))
         tr = filter_turns(self.turns, "train", require_next=True, limit=8000, seed=self.cfg.seed)
-        # The simulator adapter is what will be used at scoring time, so stratify the
-        # panel against the log-probs it produces. Load it here; if it isn't present
-        # yet, fall back to the SFT policy.
-        probe_pol = None
-        for cand in ("simulator", "sft_policy"):
-            d = self.cfg.out / cand
-            if d.exists():
-                probe_pol = self.policy_with(cand)
-                break
+        # The simulator adapter is what will be used at scoring time, so stratify the panel against
+        # the log-probs it produces.  v15: re-use the caller's already-loaded simulator instead of
+        # loading a second copy of the 3B model (v14 loaded it twice in the validate stage).
+        probe_pol = policy
+        if probe_pol is None:
+            for cand in ("simulator", "sft_policy"):
+                d = self.cfg.out / cand
+                if d.exists():
+                    probe_pol = self.policy_with(cand)
+                    break
         probe_prompt = f"{CUSTOMER_SYSTEM}\nCustomer: hello\nAgent:"
         pan = OutcomePanel.build(
             tr, self.sentiment, self.cfg.panel_size, self.cfg.seed, self.logger,
@@ -3934,7 +4089,14 @@ class Experiment:
         mode = self.cfg.outcome_mode
         if mode == "auto":
             f = self.cfg.out / "outcome_mode.json"
-            mode = load_json(f)["selected"] if f.exists() else "sample"
+            if not f.exists():
+                # v15: v14 silently fell back to the SAMPLED estimator here.  That is what made the
+                # validate stage fail: a Monte Carlo estimator re-run on the same responses flipped 35%
+                # of within-context pairs, so no invariance gate with a 10% flip ceiling can pass.
+                raise FileNotFoundError(
+                    f"{f} is missing: the outcome estimator has not been selected for this simulator. Run "
+                    f"the validate stage (it selects it before gating), or the simulator stage in full.")
+            mode = load_json(f)["selected"]
         pj = None
         p = self.cfg.out / "logit_projector.json"
         if load_nuisance and p.exists():
@@ -3945,7 +4107,7 @@ class Experiment:
         n_orbit = int(load_json(ob).get("n_orbit", 1)) if ob.exists() else self.cfg.orbit_levels
         sim = UserSimulator(policy, self.sentiment, self.logger,
                             rollouts if rollouts is not None else self.cfg.sim_rollouts,
-                            mode=mode, panel=self.panel(),
+                            mode=mode, panel=self.panel(policy),
                             panel_temperature=self.cfg.panel_temperature,
                             projector=pj, n_orbit=n_orbit)
         if pj is not None:
@@ -3965,6 +4127,32 @@ class Experiment:
         if g.exists():
             sim.control_variate = FrozenControlVariate.load(load_json(g))
         return sim
+
+    def sim_train_bank(self) -> str:
+        """Filler bank the simulator in cfg.out was regularised on.  Simulators trained before v15 carry
+        no record and used the courtesy bank."""
+        f = self.cfg.out / "simulator_meta.json"
+        return str(load_json(f).get("train_bank", "courtesy_v13")) if f.exists() else "courtesy_v13"
+
+    def ensure_estimator(self, sim_pol) -> str:
+        """Build and calibrate the outcome panel and select the estimator if that has not been done for
+        this simulator.  Selection uses only TRAIN-split turns, so it cannot see the validation gate."""
+        cfg = self.cfg
+        if cfg.outcome_mode != "sample":
+            panel = self.panel(sim_pol)
+            if panel is not None and not panel.calibrated:
+                cal = filter_turns(self.turns, "train", require_next=True, limit=1200, seed=cfg.seed + 11,
+                                   logger=self.logger, what="panel calibration turns")
+                panel.calibrate(sim_pol, cal, self.sentiment, self.logger, cache_file=cfg.out / "panel_cal_cache.npz")
+                dump_json(panel.state(), cfg.out / "outcome_panel.json")
+        f = cfg.out / "outcome_mode.json"
+        if cfg.outcome_mode == "auto" and not f.exists():
+            sel_turns = filter_turns(self.turns, "train", require_next=True, require_label=True, limit=400,
+                                     seed=cfg.seed + 13, logger=self.logger, what="estimator selection turns")
+            probe = UserSimulator(sim_pol, self.sentiment, self.logger, cfg.sim_rollouts, mode="sample",
+                                  panel=self.panel(sim_pol), panel_temperature=cfg.panel_temperature)
+            dump_json(select_outcome_mode(probe, sel_turns, self.logger), f)
+        return load_json(f)["selected"] if cfg.outcome_mode == "auto" else cfg.outcome_mode
 
     def policy_with(self, adapter: Optional[str]):
         p = build_policy(self.cfg, self.logger)
@@ -3994,7 +4182,8 @@ def stage_simulator(cfg: Config) -> Dict[str, Any]:
     ex = Experiment(cfg, "2_simulator")
     # A retrained simulator invalidates every artefact that was fitted on the old one.
     for stale in ("panel_cal_cache.npz", "outcome_panel.json", "logit_projector.json", "length_control.json",
-                  "control_variate.json", "orbit.json", "simulator_validation.json"):
+                  "control_variate.json", "orbit.json", "simulator_validation.json", "validation_gate_sample.npz",
+                  "invariance_selection.json"):
         f = cfg.out / stale
         if f.exists():
             f.unlink()
@@ -4004,26 +4193,17 @@ def stage_simulator(cfg: Config) -> Dict[str, Any]:
     dv = filter_turns(ex.turns, "valid", require_next=True, limit=1500, seed=cfg.seed, logger=ex.logger,
                       what="simulator dev turns")
     pol = build_policy(cfg, ex.logger)
+    for stale in ("outcome_mode.json",):
+        if (cfg.out / stale).exists():
+            (cfg.out / stale).unlink()
     res = sim_fit = UserSimulator(pol, ex.sentiment, ex.logger, cfg.sim_rollouts, mode="sample").fit(
-        tr, dv, cfg.sim_sft, cfg.out / "sim_best", augment_levels=2, seed=cfg.seed)
+        tr, dv, cfg.sim_sft, cfg.out / "sim_best", augment_levels=2, seed=cfg.seed, bank=cfg.sim_train_bank)
     del sim_fit
     pol.save_adapter(cfg.out / "simulator")
+    dump_json({"train_bank": cfg.sim_train_bank, "invariance_coef": cfg.sim_sft.invariance_coef,
+               "version": VERSION}, cfg.out / "simulator_meta.json")
     dump_json(res, cfg.out / "simulator.json")
-    if cfg.outcome_mode != "sample":
-        panel = ex.panel()
-        if panel is not None and not panel.calibrated:
-            cal = filter_turns(ex.turns, "train", require_next=True, limit=1200, seed=cfg.seed + 11,
-                               logger=ex.logger, what="panel calibration turns")
-            panel.calibrate(pol, cal, ex.sentiment, ex.logger, cache_file=cfg.out / "panel_cal_cache.npz")
-            dump_json(panel.state(), cfg.out / "outcome_panel.json")
-    if cfg.outcome_mode == "auto":
-        sel_turns = filter_turns(ex.turns, "train", require_next=True, require_label=True, limit=400,
-                                 seed=cfg.seed + 13, logger=ex.logger, what="estimator selection turns")
-        probe = UserSimulator(pol, ex.sentiment, ex.logger, cfg.sim_rollouts, mode="sample",
-                              panel=ex.panel(), panel_temperature=cfg.panel_temperature)
-        rep = select_outcome_mode(probe, sel_turns, ex.logger)
-        dump_json(rep, cfg.out / "outcome_mode.json")
-        res["outcome_mode"] = rep
+    res["outcome_mode"] = ex.ensure_estimator(pol)
     return res
 
 
@@ -4059,6 +4239,30 @@ def _invariance_stats(y0: np.ndarray, y1: np.ndarray, gid: np.ndarray, cluster: 
             "delta_mean": float(np.mean(d)), "sd_within": within_group_sd(y0, gid)}
 
 
+def stability_constraint(sent: np.ndarray, Z0: np.ndarray, Z1: np.ndarray, base: Sequence[str],
+                         pert: Sequence[str], gid: np.ndarray, cluster: np.ndarray,
+                         pj: Optional["LogitNullspaceProjector"], limit: float, seed: int) -> Callable[[float], bool]:
+    """Admissibility of a panel temperature: after the interventional length calibration fitted on
+    the SAME fitting pairs, the within-context flip rate of the (base, padded) pairs must not exceed
+    `limit`.  Only FIT-half data enter, so the TEST gate stays untouched.  `limit` is the
+    pre-registered ceiling times a safety factor < 1: a temperature that only just passes on the
+    fitting half is the one most likely to fail on a new sample (v13 passed the gate at flip 0.083
+    and then measured 0.16-0.19 on a fresh sample)."""
+    base, pert = list(base), list(pert)
+
+    def ok(T: float) -> bool:
+        y0 = OutcomePanel.expectation(Z0, sent, T, pj)
+        y1 = OutcomePanel.expectation(Z1, sent, T, pj)
+        try:
+            h = InterventionalLengthCalibration().fit(base, pert, y1 - y0, cluster, None, seed=seed)
+            y0, y1 = h.apply(base, y0), h.apply(pert, y1)
+        except ValueError:
+            pass
+        f = _pairwise_flip_rate(y0, y1, gid)
+        return (not math.isfinite(f)) or f <= limit
+    return ok
+
+
 def _crossfit_probe(sim: "UserSimulator", k: int, Z0: np.ndarray, Z1: np.ndarray, base: Sequence[str],
                     pert: Sequence[str], gid: np.ndarray, cluster: np.ndarray, Zg: Optional[np.ndarray],
                     gold_val: Optional[np.ndarray], gold_cluster: Optional[np.ndarray], cal: Sequence[Turn],
@@ -4082,7 +4286,10 @@ def _crossfit_probe(sim: "UserSimulator", k: int, Z0: np.ndarray, Z1: np.ndarray
         for f in (0, 1):
             tr, te = fold != f, fold == f
             pj = LogitNullspaceProjector.fit(Z0[tr], Z1[tr], k) if k > 0 else None
-            sim.panel.calibrate(sim.policy, cal, sim.sentiment, logger, projector=pj, quiet=True)
+            itr = np.flatnonzero(tr)
+            adm = stability_constraint(sim.panel.sent, Z0[tr], Z1[tr], [base[i] for i in itr], [pert[i] for i in itr],
+                                       gid[tr], cluster[tr], pj, cfg.stability_safety * cfg.max_abs_flip, cfg.seed)
+            sim.panel.calibrate(sim.policy, cal, sim.sentiment, logger, projector=pj, quiet=True, admissible=adm)
             T = sim.panel.temperature
             temps.append(T)
             y0 = OutcomePanel.expectation(Z0, sim.panel.sent, T, pj)
@@ -4111,25 +4318,38 @@ def stage_validate(cfg: Config) -> Dict[str, Any]:
 
     Pre-registered order (never revisited after seeing the gate):
       1. split the validation pool into dialogue-disjoint FIT and TEST halves;
-      2. on FIT, sample natural variants and pad them with the TRAIN filler bank (rungs 1-2);
+      0. [v15] make sure the outcome estimator was selected (TRAIN-split data only), instead of silently
+         falling back to the sampled estimator as v14 did;
+      2. on FIT, sample natural variants and pad them with the affect-neutral CALIB bank (rungs 1-2);
       3. [expected mode] profile the length-response subspace of the panel logits and choose the
          SMALLEST erasure rank k whose two-fold out-of-fold probe passes the tau and flip
          ceilings while retaining >= projector_min_anchor_retention of the k=0 human anchor;
-      4. freeze the projector and temperature, fit the INTERVENTIONAL length calibration h(L)
-         and the control variate on FIT;
+      4. freeze the projector and the temperature -- v15: the temperature maximises the calibration
+         anchor SUBJECT TO a FIT-half flip rate <= stability_safety x the flip ceiling -- and fit the
+         INTERVENTIONAL length calibration h(L) and the control variate on FIT;
       5. gate on TEST, perturbing with the disjoint HELD-OUT filler bank.
     Nothing in step 5 can feed back into steps 1-4."""
     ex = Experiment(cfg, "3_validate")
     sim_pol = ex.policy_with("simulator")
+    selected = ex.ensure_estimator(sim_pol)       # v15: never fall back silently to the sampled estimator
     sim = ex.simulator(sim_pol, load_nuisance=False)
     sim.length_control = None
     sim.projector = None
     sim.control_variate = None
-    ex.logger.info("outcome estimator in use: %s | gate filler bank: %s (disjoint from the %s bank used for "
-                   "simulator training and every fitted correction)", sim.mode, cfg.gate_bank, "train")
-    if cfg.gate_bank == "train":
-        ex.logger.warning("the gate is using the TRAIN filler bank: it only certifies invariance to fillers the "
-                          "simulator was regularised on (circular); use --gate-bank heldout for a real test")
+    sim_bank = ex.sim_train_bank()
+    ex.logger.info("outcome estimator in use: %s (selected: %s) | simulator regularised on the '%s' filler bank | "
+                   "corrections fitted on the '%s' bank | gate on the '%s' bank", sim.mode, selected, sim_bank,
+                   FIT_BANK, cfg.gate_bank)
+    if cfg.gate_bank in (sim_bank, FIT_BANK):
+        ex.logger.warning("the gate re-uses a filler bank that a training or fitting step has seen (circular); use "
+                          "--gate-bank heldout for a real test")
+    if sim_bank == "courtesy_v13":
+        ex.logger.warning("this simulator was regularised to be INVARIANT to courtesy phrases (the pre-v15 bank, "
+                          "mean sentiment ~+0.4): it was trained to ignore part of the affect signal this work "
+                          "rewards. Retrain it (stage simulator) for the paper; it is kept here only for analysis.")
+    if sim.mode == "sample":
+        ex.logger.warning("the SAMPLED estimator is in use: its Monte Carlo noise alone flips a large share of "
+                          "within-context pairs, so the flip gate is expected to fail (the v14 run: 34.6%%)")
     prop = ex.policy_with("sft_policy")
     pool = filter_turns(ex.turns, "valid", require_next=True,
                         limit=cfg.validate_contexts + cfg.projector_fit_contexts,
@@ -4148,16 +4368,18 @@ def stage_validate(cfg: Config) -> Dict[str, Any]:
         sim.panel.calibrate(sim_pol, cal, ex.sentiment, ex.logger, projector=None,
                             cache_file=cfg.out / "panel_cal_cache.npz")
 
-    flat_f, base_f, pert_f, gid_f, cl_f = make_length_pairs(fitset, prop, ex.gen(0.9), 2, 6161, "train")
-    ex.logger.info("FIT-half paired interventions | %d (base, padded) pairs over %d contexts | train bank, "
-                   "rungs {1,2} | +%.1f words mean", len(base_f), len(fitset),
+    flat_f, base_f, pert_f, gid_f, cl_f = make_length_pairs(fitset, prop, ex.gen(0.9), 2, 6161, FIT_BANK)
+    ex.logger.info("FIT-half paired interventions | %d (base, padded) pairs over %d contexts | %s bank, "
+                   "rungs {1,2} | +%.1f words mean", len(base_f), len(fitset), FIT_BANK,
                    float(np.mean([len(b.split()) - len(a.split()) for a, b in zip(base_f, pert_f)])))
 
     sel: Dict[str, Any] = {"enabled": False, "trace": []}
     k_sel, pj = 0, None
-    if sim.mode == "expected" and cfg.projector_k_max > 0 and sim.panel is not None:
+    Z0 = Z1 = None
+    if sim.mode == "expected" and sim.panel is not None:
         Z0 = sim.panel_logits(flat_f, base_f)
         Z1 = sim.panel_logits(flat_f, pert_f)
+    if sim.mode == "expected" and cfg.projector_k_max > 0 and sim.panel is not None:
         rows = LogitNullspaceProjector.profile(Z0, Z1, cfg.projector_k_max, ex.logger)
         res = {r["k"]: r["residual_perturbation"] for r in rows}
         grid, last = [0], res.get(0, 1.0)
@@ -4208,7 +4430,11 @@ def stage_validate(cfg: Config) -> Dict[str, Any]:
     sim.projector = pj
     sim.n_orbit = max(1, int(cfg.orbit_levels))
     if sim.mode == "expected":
-        sim.panel.calibrate(sim_pol, cal, ex.sentiment, ex.logger, projector=pj)
+        adm = None
+        if Z0 is not None and cfg.stability_safety > 0:
+            adm = stability_constraint(sim.panel.sent, Z0, Z1, base_f, pert_f, gid_f, cl_f, pj,
+                                       cfg.stability_safety * cfg.max_abs_flip, cfg.seed)
+        sim.panel.calibrate(sim_pol, cal, ex.sentiment, ex.logger, projector=pj, admissible=adm)
         dump_json(sim.panel.state(), cfg.out / "outcome_panel.json")
     dump_json((pj.state() if pj is not None else {"k": 0}), cfg.out / "logit_projector.json")
     dump_json({"n_orbit": sim.n_orbit}, cfg.out / "orbit.json")
@@ -4900,7 +5126,7 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
         base = [str(x) for x in z["base"]]
         gid, cl = z["gid"], z["cluster"]
         padded = {"heldout": ([str(x) for x in z["longer"]], [str(x) for x in z["longA"]], [str(x) for x in z["longB"]])}
-        padded.update(_pad_sets(base, ["train"], cfg.seed + 3))
+        padded.update(_pad_sets(base, [b for b in (ex.sim_train_bank(), FIT_BANK) if b != "heldout"], cfg.seed + 3))
         raw = lambda tx, fl=flat: sim.rollout(fl, list(tx), crn_seed=cfg.seed + 3)
         y0r = raw(base)
         y1r = raw(padded["heldout"][0])
@@ -4951,7 +5177,7 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
     gid = np.repeat(np.arange(len(te)), k)
     cl = np.asarray([t.dialogue_id for t in flat])
     raw = lambda tx, fl=flat: sim.rollout(fl, list(tx), crn_seed=4321)
-    padded = _pad_sets(base, ["train", "heldout"], 911)
+    padded = _pad_sets(base, list(dict.fromkeys([ex.sim_train_bank(), FIT_BANK, "heldout"])), 911)
     cells += _correction_cells(flat, base, padded, raw, obs, h_int, gid, cl, cfg, sim.mode, "independent", label,
                                ex.logger)
     arrays.update({"y0": raw(base), "gid": gid, "cluster": np.asarray([str(c) for c in cl])})
@@ -5147,7 +5373,7 @@ def stage_sensitivity(cfg: Config) -> Dict[str, Any]:
         gid = z["gid"]
         cl = z["cluster"]
         rows = []
-        for bank in ("train", "heldout"):
+        for bank in FILLER_BANKS:
             if f"y1_{bank}" not in z.files:
                 continue
             for mf in (0.10, 0.15, 0.20, 0.25):
@@ -5770,9 +5996,11 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
                 "supported" if rel <= 0.75 else "not supported",
                 {"none_delta": n0["delta_mean"], "h_delta": v12["delta_mean"], "ratio": rel,
                  "none_tau": n0["tau_corrected"], "h_tau": v12["tau_corrected"]})
-        tr, ho = cell(sample, "none", "train"), cell(sample, "none", "heldout")
+        sb = _get(cfg.out / "simulator_meta.json").get("train_bank", "courtesy_v13")
+        tr, ho = cell(sample, "none", sb), cell(sample, "none", "heldout")
         if tr and ho:
-            add(f"heldout_stricter[{sample}]", "the held-out filler bank is a stricter test than the train bank",
+            add(f"heldout_stricter[{sample}]", "the held-out filler bank is a stricter test than the bank the "
+                "simulator was regularised on",
                 "supported" if abs(ho["delta_mean"]) > abs(tr["delta_mean"]) else "not supported (the paper may only "
                 "say the train bank is not an independent test)", {"train": tr["delta_mean"], "heldout": ho["delta_mean"]})
     nr = next((c for c in abs_.get("cells", []) if c.get("simulator") == "no_invariance_regulariser"
@@ -6152,6 +6380,8 @@ _FLAGS: List[Tuple[str, str, Any, str]] = [
     ("--external-rollouts", "external_rollouts", int, ""),
     ("--human-contexts", "human_contexts", int, ""), ("--human-validity-pairs", "human_validity_pairs", int, ""),
     ("--noninferiority-info-margin", "noninferiority_info_margin", float, ""),
+    ("--stability-safety", "stability_safety", float, "FIT-half flip limit as a fraction of --max-abs-flip "
+                                                      "when choosing the panel temperature (0 disables)"),
     ("--cross-eval-contexts", "cross_eval_contexts", int, "held-out contexts for cross-evaluator agreement"),
     ("--cross-eval-k", "cross_eval_k", int, "responses per context for cross-evaluator agreement"),
 ]
@@ -6190,6 +6420,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--arm", default=None)
     p.add_argument("--arms", nargs="+", default=list(d.arms), choices=list(KNOWN_ARMS))
     p.add_argument("--outcome-mode", default=d.outcome_mode, choices=["auto", "expected", "sample"])
+    p.add_argument("--sim-train-bank", default=d.sim_train_bank, choices=["train", "courtesy_v13"],
+                   help="filler bank the simulator is regularised on; courtesy_v13 reproduces pre-v15 simulators")
     p.add_argument("--gate-bank", default=d.gate_bank, choices=sorted(FILLER_BANKS),
                    help="filler bank for the validation gates; 'train' is circular and only for debugging")
     return p.parse_args(list(argv))
@@ -6218,6 +6450,7 @@ def build_config(a: argparse.Namespace) -> Config:
     cfg.strict = bool(a.strict)
     cfg.outcome_mode = a.outcome_mode
     cfg.gate_bank = a.gate_bank
+    cfg.sim_train_bank = a.sim_train_bank
     cfg.ablate_sim_noreg = bool(a.ablate_sim_noreg)
     cfg.sim_sft.gap_aborts = bool(a.gap_aborts)
     cfg.sft.invariance_coef = 0.0          # the agent SFT has no invariance penalty; only the simulator does
@@ -6341,6 +6574,21 @@ def _unit_tests() -> None:
     assert info_recall("Booked at the Gonville, ref XYZ123.", "Your Gonville booking is done, reference XYZ123.") > 0.3
     assert info_recall("So sorry, glad to help!", "Your Gonville booking is done, reference XYZ123.") == 0.0
     assert math.isnan(info_recall("Hello.", "Thank you, goodbye!"))
+    # (9) Stability-constrained temperature: an inadmissible optimum must not be chosen, and an empty
+    #     admissible set must fall back to the unconstrained optimum (reported, never silently widened).
+    r9 = np.random.default_rng(9)
+    turns9 = [Turn(f"d{i}", f"d{i}#0", "train", "x", 0, "", "hi", "ok.", "fine.", 0, 0) for i in range(150)]
+    pan = OutcomePanel([f"c{i}" for i in range(12)], np.linspace(-1, 1, 12))
+    lp9 = r9.normal(size=(150, 12))
+    target9 = lp9 @ np.linspace(-1, 1, 12) + r9.normal(0, 0.5, 150)
+    pan._cal_cache = (sha_of([t.uid for t in turns9] + pan.texts), lp9, target9)
+    q9 = logging.getLogger("caro.unit")
+    pan.calibrate(None, turns9, None, q9, quiet=True)
+    t_free = pan.temperature
+    pan.calibrate(None, turns9, None, q9, quiet=True, admissible=lambda T: T != t_free)
+    assert pan.temperature != t_free and pan.calibration["stability_constrained"]
+    pan.calibrate(None, turns9, None, q9, quiet=True, admissible=lambda T: False)
+    assert pan.temperature == t_free and pan.calibration["n_admissible_T"] == 0
     print(f"unit tests OK | exact sign-flip p={sf['p']:.5f} | exact vs MC {pe:.4f}/{pm:.4f} | dialogue clusters "
           f"{c7['n_clusters']} with SE unchanged by seed copies")
 
