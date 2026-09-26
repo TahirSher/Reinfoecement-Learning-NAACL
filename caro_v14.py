@@ -3763,6 +3763,7 @@ def evaluate(policy, sim: UserSimulator, turns: Sequence[Turn], gen: GenConfig, 
                    "response": r, "outcome": float(yy), "sentiment": float(ss),
                    "words": len(r.split()), "hygiene_ok": float(good), "reasons": reasons,
                    "info_recall": info_recall(r, t.gold_response), "gold_words": len(t.gold_response.split()),
+                   **dict(zip(("slot_precision", "slot_recall", "slot_f1"), slot_prf(r, t.gold_response))),
                    "human_valence": t.human_valence}
             if extra is not None:
                 row.update(extra[s + j])
@@ -3860,6 +3861,8 @@ class Config:
     human_overlap: float = 0.3              # R3: share of items annotated twice (for agreement)
     human_comparisons: Tuple[str, ...] = ("caro:sft", "caro:sentiment_only", "caro:dpo")
     noninferiority_info_margin: float = 0.05   # D4: information-retention non-inferiority margin (recall units)
+    cross_eval_contexts: int = 500             # held-out contexts for cross-evaluator agreement
+    cross_eval_k: int = 4                      # responses per context (K=4 -> 6 pairs per context)
 
 
 def build_policy(cfg: Config, logger: logging.Logger):
@@ -4487,7 +4490,7 @@ def stage_eval(cfg: Config, arm: str, seed: int) -> Dict[str, Any]:
     return {"n": len(rows)}
 
 
-REPORT_METRICS = ("outcome", "words", "hygiene_ok", "sentiment", "info_recall")
+REPORT_METRICS = ("outcome", "words", "hygiene_ok", "sentiment", "info_recall", "slot_f1", "slot_recall")
 
 
 def load_eval_rows(cfg: "Config", arms: Optional[Sequence[str]] = None, prefix: str = "eval"
@@ -4522,7 +4525,7 @@ def contrast_family(rows: Dict[str, Dict[int, List[Dict[str, Any]]]], plan: Sequ
         for m in metrics:
             c = pooled_paired_contrast(rows[a], rows[b], m, seed=seed,
                                        margin=(margin if m == "outcome" else None),
-                                       noninferiority_margin=(info_margin if m == "info_recall" else None),
+                                       noninferiority_margin=(info_margin if m in ("info_recall", "slot_f1") else None),
                                        n_mc=n_mc)
             if c.get("n"):
                 out[f"{a}_vs_{b}:{m}"] = {**c, "arm": a, "comparator": b, "metric": m}
@@ -6003,6 +6006,10 @@ def stage_analysis(cfg: Config, with_gpu_ablation: bool = True, with_external: b
             stage_eval_external(cfg)
         except Exception as e:                      # a missing model should not sink the analysis
             log.error("external evaluation skipped: %s", e)
+    try:
+        stage_cross_eval(cfg)
+    except Exception as e:
+        log.error("cross-evaluator agreement skipped: %s", e)
     stage_ablate_reward(cfg)
     if with_gpu_ablation:
         try:
@@ -6091,7 +6098,7 @@ def make_synthetic_emowoz(data_dir: Path, n_dialogues: int = 420, seed: int = 0)
     dump_json(split, data_dir / "data-split.json")
 
 
-STAGES = ["all", "sft", "simulator", "validate", "corpus", "reward", "train", "eval", "report", "eval-external",
+STAGES = ["all", "sft", "simulator", "validate", "corpus", "reward", "train", "eval", "report", "eval-external", "cross-eval",
           "ablate-reward", "ablate-simulator", "sensitivity", "length-analysis", "human-export", "human-analyze",
           "claims", "paper", "analysis", "selftest"]
 
@@ -6145,6 +6152,8 @@ _FLAGS: List[Tuple[str, str, Any, str]] = [
     ("--external-rollouts", "external_rollouts", int, ""),
     ("--human-contexts", "human_contexts", int, ""), ("--human-validity-pairs", "human_validity_pairs", int, ""),
     ("--noninferiority-info-margin", "noninferiority_info_margin", float, ""),
+    ("--cross-eval-contexts", "cross_eval_contexts", int, "held-out contexts for cross-evaluator agreement"),
+    ("--cross-eval-k", "cross_eval_k", int, "responses per context for cross-evaluator agreement"),
 ]
 
 
@@ -6448,13 +6457,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
     cfg = build_config(a)
     arms = [a.arm] if a.arm else ordered_arms(cfg.arms)
-    simple = {"all": stage_all, "sft": stage_sft, "simulator": stage_simulator, "validate": stage_validate,
-              "corpus": stage_corpus, "reward": stage_reward, "report": stage_report,
-              "eval-external": stage_eval_external, "ablate-reward": stage_ablate_reward,
-              "ablate-simulator": stage_ablate_simulator, "sensitivity": stage_sensitivity,
-              "length-analysis": stage_length_analysis, "human-export": stage_human_export,
-              "human-analyze": stage_human_analyze, "claims": stage_claims, "paper": stage_paper,
-              "analysis": stage_analysis}
+    # Stage names are resolved from globals() when main() runs.  That only works because the
+    # `if __name__ == "__main__"` guard is the LAST statement of the module: Python executes the file
+    # top to bottom, so a function defined below the guard does not exist yet when main() is called.
+    _dispatch = {
+        "all": "stage_all", "sft": "stage_sft", "simulator": "stage_simulator",
+        "validate": "stage_validate", "corpus": "stage_corpus", "reward": "stage_reward",
+        "report": "stage_report", "eval-external": "stage_eval_external",
+        "cross-eval": "stage_cross_eval",
+        "ablate-reward": "stage_ablate_reward", "ablate-simulator": "stage_ablate_simulator",
+        "sensitivity": "stage_sensitivity", "length-analysis": "stage_length_analysis",
+        "human-export": "stage_human_export", "human-analyze": "stage_human_analyze",
+        "claims": "stage_claims", "paper": "stage_paper", "analysis": "stage_analysis",
+    }
+    simple = {k: globals()[v] for k, v in _dispatch.items()}
     if a.stage in simple:
         simple[a.stage](cfg)
     elif a.stage == "train":
@@ -6467,5 +6483,166 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 stage_eval(cfg, arm, sd)
 
 
-if __name__ == "__main__":
+
+
+# ---------------------------------------------------------------------------------------------
+# v14 automatic-evidence additions (appended; self-contained top-level definitions)
+# ---------------------------------------------------------------------------------------------
+SLOT_PATTERNS = {
+    "time":     re.compile(r"\b\d{1,2}[:.]\d{2}\s*(?:am|pm)?\b|\b\d{1,2}\s*(?:am|pm)\b", re.I),
+    "date":     re.compile(
+        r"\b(?:mon|tue|wed|thu|fri|sat|sun)\w*\b"
+        r"|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b"
+        r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}\b", re.I),
+    "price":    re.compile(r"[£$€]\s?\d+(?:\.\d{1,2})?|\b\d+\s?(?:pounds?|dollars?|euros?)\b", re.I),
+    "ref":      re.compile(r"\b(?:ref(?:erence)?|code|number|booking)\s*[:#]?\s*[A-Z0-9]{4,}\b"
+                           r"|\b[A-Z]{2,}\d{3,}\b"),
+    "postcode": re.compile(r"\b[A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2}\b", re.I),
+    "phone":    re.compile(r"\b(?:\+?\d[\d\s\-]{7,}\d)\b"),
+    "venue":    re.compile(r"\b(?:hotel|restaurant|museum|college|hospital|park|station|airport|cafe|pub|"
+                           r"theatre|theater|cinema|gallery|club|inn|lodge)\b", re.I),
+}
+
+
+def slot_set(text: str) -> Dict[str, set]:
+    t = norm_text(text)
+    return {k: set(p.findall(t)) for k, p in SLOT_PATTERNS.items()}
+
+
+def slot_prf(response: str, reference: str) -> Tuple[float, float, float]:
+    rr, rg = slot_set(response), slot_set(reference)
+    gold = set().union(*rg.values()) if rg else set()
+    pred = set().union(*rr.values()) if rr else set()
+    if not gold:
+        return float("nan"), float("nan"), float("nan")
+    hit = len(gold & pred)
+    p = hit / max(len(pred), 1)
+    r = hit / len(gold)
+    f = 2 * p * r / max(p + r, 1e-9)
+    return float(p), float(r), float(f)
+
+
+BEHAVIOUR_FAMILIES = {
+    "apology":         re.compile(r"\b(?:sorry|apolog|unfortunately|afraid)\w*\b", re.I),
+    "acknowledgement": re.compile(r"\b(?:i understand|understood|i see|noted|of course|certainly|"
+                                  r"sure thing|absolutely|no problem|you're right|thank you)\b", re.I),
+    "offer_help":      re.compile(r"\b(?:let me|i can|i will|i'll|would you like|shall i|happy to|"
+                                  r"glad to|feel free)\b", re.I),
+    "question":        re.compile(r"\?"),
+    "hedge":           re.compile(r"\b(?:perhaps|maybe|might|possibly|it seems|it appears|"
+                                  r"i think|i believe|if you like)\b", re.I),
+    "repetition":      re.compile(r"\b(\w{3,})\s+\1\b", re.I),
+}
+
+
+def behaviour_features(text: str) -> Dict[str, float]:
+    t = norm_text(text)
+    w = max(1, len(t.split()))
+    return {f"beh_{k}": 100.0 * len(p.findall(t)) / w for k, p in BEHAVIOUR_FAMILIES.items()}
+
+
+# ---------------------------------------------------------------------------------------------
+# v14 automatic-evidence addition: cross-evaluator within-context agreement.
+# ---------------------------------------------------------------------------------------------
+def _release_gpu() -> None:
+    """Collect garbage and release cached GPU memory.  The CALLER must `del` its references first:
+    deleting a name inside a helper does not drop the caller's reference to the model."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def stage_cross_eval(cfg: "Config") -> Dict[str, Any]:
+    """Automatic analogue of the within-context validity test.
+
+    For held-out contexts, sample K responses from the frozen SFT policy, score every response with
+    BOTH automatic evaluators (the CARO simulator and the out-of-family evaluator) and compare their
+    within-context PREFERENCES pairwise.  This measures the property the reward needs -- ranking
+    alternatives to the SAME context -- under a second, independent automatic evaluator.  It is NOT
+    human evidence and is reported as such.
+
+    Models are loaded one at a time and released (SFT -> simulator -> judge), so peak GPU memory is
+    one model, not three."""
+    ex = Experiment(cfg, "7_cross_eval")
+    out_file = cfg.out / "cross_eval.json"
+    if out_file.exists():
+        ex.logger.info("cross_eval.json already present; reusing (delete to recompute)")
+        return load_json(out_file)
+    te = filter_turns(ex.turns, "test", require_next=True, limit=cfg.cross_eval_contexts,
+                      seed=cfg.seed, logger=ex.logger, what="cross-eval contexts")
+    if len(te) < 50:
+        raise RuntimeError(f"cross_eval needs >= 50 test contexts, got {len(te)}")
+    K = max(2, int(cfg.cross_eval_k))
+    flat_t = [t for t in te for _ in range(K)]
+    seed0 = eval_gen_seed(cfg.seed, 0, 0)
+
+    sft = ex.policy_with("sft_policy")
+    responses = sft.generate([agent_prompt(t) for t in flat_t], ex.gen(0.7), seed=seed0)
+    del sft
+    _release_gpu()
+    sim = ex.simulator(ex.policy_with("simulator"))
+    y_sim = np.asarray(sim.rollout(flat_t, responses, crn_seed=seed0), float)
+    del sim
+    _release_gpu()
+    if cfg.stub:
+        judge, emo = StubPolicy(ex.logger, cfg.seed + 99), StubEmotion()
+    else:
+        judge = Policy(cfg.external_model, cfg.device, cfg.models_dir, ex.logger,
+                       load_4bit=cfg.load_4bit, gen_batch=cfg.gen_batch,
+                       score_batch=cfg.score_batch, with_lora=False)
+        emo = EmotionValenceScorer(cfg.external_emotion_model, cfg.device, cfg.models_dir, ex.logger)
+    reps = judge.generate(external_customer_prompts(judge, flat_t, responses),
+                          GenConfig(max_new_tokens=40, min_new_tokens=4, temperature=0.9), seed=seed0)
+    y_ext = np.asarray(emo(reps), float) - np.asarray(emo([t.user_text for t in flat_t]), float)
+    del judge, emo
+    _release_gpu()
+
+    Ys, Ye = y_sim.reshape(len(te), K), y_ext.reshape(len(te), K)
+    iu = np.triu_indices(K, 1)
+    per_ctx, kept_cl = [], []
+    agree = tot = 0
+    for c, t in enumerate(te):
+        a = (Ys[c][:, None] - Ys[c][None, :])[iu]
+        b = (Ye[c][:, None] - Ye[c][None, :])[iu]
+        m = np.abs(a) > 1e-9
+        if not m.any():
+            continue
+        hits = int(np.sum(a[m] * b[m] > 0))
+        agree += hits
+        tot += int(m.sum())
+        per_ctx.append(hits / int(m.sum()))
+        kept_cl.append(t.dialogue_id)          # cluster of THIS context (v14-as-sent sliced the first n)
+    pca = np.asarray(per_ctx, float)
+    kcl = np.asarray(kept_cl, dtype=object)
+    rate = agree / max(tot, 1)
+    _, lo, hi = cluster_bootstrap_ci(lambda ix: float(np.mean(pca[ix])), kcl, 2000, cfg.seed, conf=0.95)
+    sf = sign_flip_test(pca - 0.5, kcl, n_mc=cfg.n_signflip, seed=cfg.seed + 1)
+    # Between-context anchors on CONTEXT means: the label is per context, so correlating it with the K
+    # responses of each context would count every context K times.
+    hv = np.asarray([t.human_valence if t.human_valence is not None else np.nan for t in te], float)
+    rho_sim, rho_ext = spearman(Ys.mean(1), hv), spearman(Ye.mean(1), hv)
+    out = {"n_contexts": int(len(te)), "n_contexts_scored": int(pca.size), "K": int(K), "n_pairs": int(tot),
+           "within_context_agreement": float(rate),
+           "within_context_agreement_ctx_mean": float(pca.mean()) if pca.size else float("nan"),
+           "within_context_agreement_ci95": [float(lo), float(hi)],
+           "p_vs_chance": sf["p"], "p_vs_chance_text": sf["p_text"],
+           "between_context_rho_simulator": float(rho_sim),
+           "between_context_rho_external": float(rho_ext),
+           "n_labelled_contexts": int(np.isfinite(hv).sum()),
+           "external_model": cfg.external_model,
+           "external_emotion_model": cfg.external_emotion_model,
+           "note": "Automatic two-evaluator within-context agreement (chance = 0.5). Not human evidence."}
+    dump_json(out, out_file)
+    ex.logger.info("cross-evaluator within-context agreement | %d contexts x %d variants = %d pairs | "
+                   "agreement %.3f CI95[%.3f,%.3f] (chance 0.5, p %s) | between-context rho (context means) "
+                   "sim %.3f ext %.3f", len(te), K, tot, rate, lo, hi, sf["p_text"], rho_sim, rho_ext)
+    return out
+
+
+if __name__ == "__main__":      # keep this the last statement of the file (see main())
     main()
