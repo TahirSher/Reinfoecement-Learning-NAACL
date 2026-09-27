@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CARO v15 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
+"""CARO v16 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
 
 Stages: sft -> simulator -> validate -> corpus -> reward -> train -> eval -> report  (or `all`),
 then analysis (ablations, sensitivity, length analysis, external evaluator, claims, LaTeX), and
@@ -12,6 +12,34 @@ simulator scores counterfactual agent responses by the affect of the customer re
 expected to elicit, a reward model is fitted to those counterfactual outcomes, and the agent is
 optimised against it with GRPO.  The target is emotional appropriateness WITHOUT loss of task
 information, so information retention is measured and tested for non-inferiority.
+
+What changed from v15 (prompted by the v15 simulator and validate logs; the simulator adapter stays valid,
+stages 3+ must be re-run):
+  W1  The problem the logs expose.  Neither v15 estimator can label a counterfactual corpus.  The panel
+      expectation is reproducible but carries almost no response-level human signal (selection anchor
+      0.04, CI through zero); the sampled estimator carries signal but its Monte Carlo noise is 0.91x
+      the within-context signal sd (replication flips 35.8%).  With independent rollouts, reaching a 10%
+      replication flip rate needs ~192 rollouts per response, 16x the current cost.
+  W2  New estimator ("pool"): shared-reply-pool multiple importance sampling.  Per context ONE pool of
+      simulated customer replies is drawn from a mixture of proposal agent turns (gold + candidates);
+      every response to that context is scored on the SAME replies with self-normalised
+      balance-heuristic weights p(c|x,r)/q(c) (Veach & Guibas 1995; Owen & Zhou 2000), truncated as in
+      Ionides (2008).  It targets the sampled estimator's estimand, E[sentiment of the next customer
+      turn], but its Monte Carlo error is common to all responses of a context and largely cancels in
+      within-context comparisons.  Given the pool it is deterministic; pools persist on disk, so every
+      evaluation arm is scored on the same replies.  The replication null re-draws an independent pool,
+      which gives the first non-trivial reliability (ICC) statistic this pipeline reports.
+  W3  Estimator selection is fixed and made evidence-based.  v15 correlated a SHIFT (raw minus current
+      sentiment) with an ABSOLUTE human label, which is why the panel scored 0.04 at selection and 0.51
+      at the gate.  Selection now (a) measures reproducibility on real response pairs (replication flip
+      rate <= the gate's ceiling to be eligible) and (b) ranks eligible estimators by the PARTIAL human
+      anchor.
+  W4  Partial human anchor everywhere.  The absolute anchor (the paper's C2 = 0.547) is inflated by
+      emotional carry-over: the current turn's human emotion predicts the next one whatever the agent
+      says.  The gate, the objective table and the claims now also report the correlation conditional on
+      the current turn's human label; a warning is raised if it does not exclude zero.
+  W5  Ablation cells of a stochastic estimator use its real replication null (an independent pool).
+Nothing here relaxes a threshold.
 
 What changed from v14 (all prompted by the failed v14 validate run; stages 3+ must be re-run):
   V1  Root cause of the failure.  With --outcome-mode auto and no outcome_mode.json in the run
@@ -294,8 +322,8 @@ FILLER_BANKS = {"courtesy_v13": (NEUTRAL_TAILS, NEUTRAL_HEADS), "train": (TRAIN_
 FIT_BANK = "calib"
 _all_fill = [x for b in FILLER_BANKS.values() for part in b for x in part]
 assert len(_all_fill) == len(set(_all_fill)), "filler banks must be disjoint"
-VERSION = "v15"
-COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15")   # stage-3/4/5 artefacts from v9 onwards remain valid
+VERSION = "v16"
+COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16")   # stage-3/4/5 artefacts from v9 onwards remain valid
 
 # Arms that are optimised (need a train stage) versus arms that only re-use the SFT adapter.
 TRAINED_ARMS = ("sentiment_only", "dpo", "caro", "caro_no_abstain")
@@ -422,6 +450,25 @@ def pearson(x: np.ndarray, y: np.ndarray) -> float:
     b = y[ok] - y[ok].mean()
     d = math.sqrt(float(a @ a) * float(b @ b))
     return float(a @ b / d) if d > EPS else float("nan")
+
+
+def partial_spearman(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    """Spearman correlation of x and y after removing the rank-linear effect of z from both.
+
+    Used for the human anchor (v16).  The human label is the ABSOLUTE emotion of the customer's next
+    turn, which is largely carried over from the CURRENT turn: an outcome that only echoes the
+    current state correlates with it without responding to the agent at all.  Conditioning on the
+    current turn's human label isolates the part of the anchor that can come from the response."""
+    x, y, z = (np.asarray(v, float) for v in (x, y, z))
+    ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    if int(ok.sum()) < 10:
+        return float("nan")
+    rx, ry, rz = rankdata(x[ok]), rankdata(y[ok]), rankdata(z[ok])
+    Z = np.stack([np.ones(rz.size), rz], 1)
+
+    def resid(v):
+        return v - Z @ np.linalg.lstsq(Z, v, rcond=None)[0]
+    return pearson(resid(rx), resid(ry))
 
 
 def fisher_ci(rho: float, n: int) -> Tuple[float, float]:
@@ -1036,6 +1083,13 @@ class Turn:
         if self.next_emotion is None or self.next_emotion < 0:
             return None
         return EMOTION_ORDINAL.get(int(self.next_emotion))
+
+    @property
+    def current_valence(self) -> Optional[float]:
+        """Human emotion label of the customer's CURRENT turn, on the same ordinal scale."""
+        if self.user_emotion is None or self.user_emotion < 0:
+            return None
+        return EMOTION_ORDINAL.get(int(self.user_emotion))
 
     @property
     def human_satisfaction(self) -> Optional[float]:
@@ -1843,6 +1897,64 @@ class Policy:
                     out[jobs[r][0], jobs[r][1]] = v
         return out
 
+    def pair_logprobs(self, prefixes: Sequence[str], candidates: Sequence[str]) -> np.ndarray:
+        """Summed log p(candidate_i | prefix_i) for aligned lists (not a cross product).
+
+        Same tokenisation, truncation and fast tail-logit path as candidate_logprobs, which verifies
+        the fast path against the reference path on its first call; each distinct string is tokenised
+        once."""
+        import torch
+        prefixes, candidates = list(prefixes), list(candidates)
+        if len(prefixes) != len(candidates):
+            raise ValueError("pair_logprobs: ragged inputs")
+        if not prefixes:
+            return np.zeros(0, float)
+        if not self._fast_verified:
+            up, uc = list(dict.fromkeys(prefixes))[:3], list(dict.fromkeys(candidates))[:16]
+            self.candidate_logprobs(up, uc)             # runs the fast-vs-reference verification once
+        if not self.fast_score:
+            out = []
+            for s0 in range(0, len(prefixes), max(1, self.gen_batch)):
+                with torch.no_grad():
+                    out.extend(self._seq_logprob(list(zip(prefixes[s0:s0 + self.gen_batch],
+                                                          candidates[s0:s0 + self.gen_batch])), reduce="sum")
+                               .cpu().tolist())
+            return np.asarray(out, float)
+        self.model.eval()
+        eos = self.tok.eos_token or ""
+        tp = {p: self.tok(p, add_special_tokens=False)["input_ids"] for p in dict.fromkeys(prefixes)}
+        tc = {c: self.tok(" " + norm_text(c) + eos, add_special_tokens=False)["input_ids"] for c in dict.fromkeys(candidates)}
+        jobs = []
+        for p, c in zip(prefixes, candidates):
+            seq = (tp[p] + tc[c])[-self.max_len:]
+            jobs.append((seq, max(0, min(len(tc[c]), len(seq) - 1))))
+        order = sorted(range(len(jobs)), key=lambda k: len(jobs[k][0]))
+        out = np.zeros(len(jobs), float)
+        pad = self.tok.pad_token_id
+        b = max(1, self.score_batch)
+        with torch.no_grad():
+            for s0 in range(0, len(order), b):
+                ks = order[s0:s0 + b]
+                seqs = [jobs[k][0] for k in ks]
+                nts = [jobs[k][1] for k in ks]
+                n = max(len(x) for x in seqs)
+                T = max(1, max(nts))
+                X = torch.full((len(ks), n), pad, dtype=torch.long)
+                M = torch.zeros((len(ks), n), dtype=torch.long)
+                for r, sq in enumerate(seqs):
+                    X[r, n - len(sq):] = torch.tensor(sq)
+                    M[r, n - len(sq):] = 1
+                pos = (M.cumsum(1) - 1).clamp_min(0)
+                X, M, pos = X.to(self.device), M.to(self.device), pos.to(self.device)
+                lg = self._forward_tail(X, M, pos, T + 1)[:, :-1].float()
+                tgt = X[:, n - T:]
+                lp = torch.log_softmax(lg, -1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+                nt = torch.tensor(nts, device=lp.device)
+                sel = (torch.arange(T, device=lp.device)[None, :] >= (T - nt)[:, None]).float()
+                for r, v in zip(ks, (lp * sel).sum(1).cpu().tolist()):
+                    out[r] = v
+        return out
+
     def sequence_logprobs(self, prompts: Sequence[str], responses: Sequence[str], batch: int = 4,
                           use_adapter: bool = True) -> np.ndarray:
         import torch
@@ -2074,6 +2186,16 @@ class StubPolicy:
             h = int(hashlib.sha256(p.encode()).hexdigest()[:12], 16)
             rng = np.random.default_rng(h % (2 ** 32))
             out[i] = -2.0 - 1.6 * (cs - 0.75 * rs) ** 2 + rng.normal(0, 0.05, len(candidates))
+        return out
+
+    def pair_logprobs(self, prefixes: Sequence[str], candidates: Sequence[str]) -> np.ndarray:
+        out = np.zeros(len(prefixes), float)
+        cs = np.asarray(StubSentiment()(list(candidates)), float)
+        for i, (p, c) in enumerate(zip(prefixes, candidates)):
+            resp = p.rsplit("Agent:", 1)[-1].rsplit("\nCustomer:", 1)[0]
+            rs = float(StubSentiment()([resp])[0])
+            h = int(hashlib.sha256(f"{p}||{c}".encode()).hexdigest()[:12], 16)
+            out[i] = -2.0 - 1.6 * (cs[i] - 0.75 * rs) ** 2 + np.random.default_rng(h % (2 ** 32)).normal(0, 0.05)
         return out
 
     def features(self, prompts, responses, dim: int = 256, seed: int = 12345) -> np.ndarray:
@@ -2309,12 +2431,59 @@ class OutcomePanel:
                             float(d.get("temperature", 1.0)), d.get("calibration"))
 
 
+class ReplyPoolStore:
+    """Persistent per-context pools of simulated customer replies for the shared-pool estimator.
+
+    One JSON line per (namespace, pool seed, context): the proposal agent turns, the sampled replies,
+    their sentiment and the log mixture density log q(c) = log mean_m p(c | x, r_m).  Persisting the
+    pool is what makes the estimate identical across processes (e.g. every evaluation arm is scored
+    on the same replies for a context), and it makes every re-scoring free of generation cost."""
+
+    def __init__(self, path: Optional[Path]):
+        self.path = Path(path) if path is not None else None
+        self.pools: Dict[str, Dict[str, Any]] = {}
+        if self.path is not None and self.path.exists():
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        d = json.loads(line)
+                        self.pools[d["key"]] = d
+
+    @staticmethod
+    def key(ns: str, seed: int, uid: str) -> str:
+        return f"{ns}|{seed}|{uid}"
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.pools.get(key)
+
+    def put_many(self, entries: Sequence[Dict[str, Any]]) -> None:
+        for e in entries:
+            self.pools[e["key"]] = e
+        if self.path is not None and entries:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as fh:
+                for e in entries:
+                    fh.write(json.dumps(e, default=_json_default) + "\n")
+
+
+def snis_weights(log_p: np.ndarray, log_q: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Self-normalised importance weights p/q with Ionides (2008) truncation at mean(w) * sqrt(R).
+    Returns (normalised weights, effective sample size)."""
+    lw = np.asarray(log_p, float) - np.asarray(log_q, float)
+    w = np.exp(lw - np.max(lw))
+    w = np.minimum(w, float(np.mean(w)) * math.sqrt(w.size))
+    w = w / max(float(w.sum()), EPS)
+    return w, float(1.0 / max(float(np.sum(w ** 2)), EPS))
+
+
 class UserSimulator:
     def __init__(self, policy, sentiment, logger: logging.Logger, n_rollouts: int = 12,
                  temperature: float = 0.9, max_new_tokens: int = 40, mode: str = "expected",
                  panel: Optional[OutcomePanel] = None, panel_temperature: float = 1.0,
                  projector: Optional[LogitNullspaceProjector] = None, n_orbit: int = 1,
-                 orbit_seed: int = 4242):
+                 orbit_seed: int = 4242, pool_store: Optional[ReplyPoolStore] = None,
+                 pool_size: int = 32, pool_proposals: int = 4):
         self.policy = policy
         self.sentiment = sentiment
         self.logger = logger
@@ -2332,6 +2501,101 @@ class UserSimulator:
         self.projector = projector
         self.n_orbit = max(1, int(n_orbit))
         self.orbit_seed = int(orbit_seed)
+        self.pool_store = pool_store if pool_store is not None else ReplyPoolStore(None)
+        self.pool_size = int(pool_size)
+        self.pool_proposals = max(1, int(pool_proposals))
+        self.pool_ns = "default"
+        self.pool_seed = 0
+        self.max_new_tokens = int(max_new_tokens)
+        self.last_ess: np.ndarray = np.zeros(0)
+        self._pair_cache: Dict[Tuple[str, str], float] = {}
+
+    # ---- shared-pool estimator (v16) --------------------------------------------------------------
+    def _pairs(self, prefixes: Sequence[str], replies: Sequence[str]) -> np.ndarray:
+        """log p(reply | prefix) for aligned pairs, memoised (the pool is re-scored under many prompts)."""
+        keys = [(hashlib.sha1(p.encode("utf-8")).hexdigest(), c) for p, c in zip(prefixes, replies)]
+        todo = [(k, p, c) for k, p, c in zip(keys, prefixes, replies) if k not in self._pair_cache]
+        todo = list({k: (k, p, c) for k, p, c in todo}.values())
+        if todo:
+            lp = self.policy.pair_logprobs([p for _, p, _ in todo], [c for _, _, c in todo])
+            for (k, _, _), v in zip(todo, lp):
+                self._pair_cache[k] = float(v)
+        return np.asarray([self._pair_cache[k] for k in keys], float)
+
+    def prepare(self, turns: Sequence[Turn], responses: Sequence[str]) -> int:
+        """Create (once) the reply pool of every context in the call.
+
+        Proposals for a context: its gold agent turn plus the first distinct responses of THIS call, up
+        to pool_proposals turns.  pool_size replies are drawn in total, evenly from the proposals, with
+        plain ancestral sampling (temperature 1, no top-p, no repetition penalty) so that the sampling
+        density is the model density the weights use.  Returns the number of pools created."""
+        by_uid: Dict[str, Tuple[Turn, List[str]]] = {}
+        for t, r in zip(turns, responses):
+            by_uid.setdefault(t.uid, (t, []))[1].append(norm_text(r))
+        need = []
+        for uid, (t, rs) in by_uid.items():
+            key = ReplyPoolStore.key(self.pool_ns, self.pool_seed, uid)
+            if self.pool_store.get(key) is not None:
+                continue
+            props = list(dict.fromkeys([norm_text(t.gold_response)] + rs))[: self.pool_proposals]
+            need.append((key, t, props))
+        if not need:
+            return 0
+        gen = GenConfig(max_new_tokens=self.max_new_tokens, min_new_tokens=1, temperature=1.0, top_p=1.0,
+                        repetition_penalty=1.0)
+        prompts, owner = [], []
+        for ci, (_, t, props) in enumerate(need):
+            per = [self.pool_size // len(props) + (1 if m < self.pool_size % len(props) else 0) for m in range(len(props))]
+            for m, prop in enumerate(props):
+                for _ in range(per[m]):
+                    prompts.append(customer_prompt(t, prop))
+                    owner.append(ci)
+        seed = int(hashlib.sha256(f"{self.pool_ns}|{self.pool_seed}|{need[0][0]}".encode()).hexdigest()[:8], 16)
+        replies = [r if r.strip() else "ok." for r in self.policy.generate(prompts, gen, seed=seed)]
+        sent = np.asarray(self.sentiment(replies), float)
+        owner = np.asarray(owner, int)
+        entries = []
+        for ci, (key, t, props) in enumerate(need):
+            idx = np.flatnonzero(owner == ci)
+            rep = [replies[i] for i in idx]
+            # log q(c) = log mean_m p(c | x, r_m): the balance-heuristic mixture density
+            L = np.stack([self._pairs([customer_prompt(t, pr)] * len(rep), rep) for pr in props], 0)
+            mx = L.max(0)
+            log_q = mx + np.log(np.mean(np.exp(L - mx), 0))
+            entries.append({"key": key, "uid": t.uid, "proposals": props, "replies": rep,
+                            "sent": sent[idx].tolist(), "log_q": log_q.tolist()})
+        self.pool_store.put_many(entries)
+        return len(entries)
+
+    def _raw_pool(self, turns: Sequence[Turn], responses: Sequence[str]) -> np.ndarray:
+        """Shared-pool multiple-importance-sampling estimate of E[sentiment(next customer turn)].
+
+        Every response to a context is scored on the SAME replies c_1..c_R of that context:
+            O(x, r) = sum_j w_j s(c_j),   w_j proportional to p(c_j | x, r) / q(c_j)   (self-normalised)
+        with q the mixture of the proposal turns (balance heuristic, Veach & Guibas 1995; Owen & Zhou
+        2000).  The estimand is the one the sampled estimator targets, but the Monte Carlo error is
+        common to all responses of a context, so it largely cancels in within-context comparisons,
+        which is what the corpus labels are.  Given the pool the estimate is deterministic."""
+        turns, responses = list(turns), [norm_text(r) for r in responses]
+        self.prepare(turns, responses)
+        pre, rep, row = [], [], []
+        pools = []
+        for i, (t, r) in enumerate(zip(turns, responses)):
+            pool = self.pool_store.get(ReplyPoolStore.key(self.pool_ns, self.pool_seed, t.uid))
+            pools.append(pool)
+            pre.extend([customer_prompt(t, r)] * len(pool["replies"]))
+            rep.extend(pool["replies"])
+            row.extend([i] * len(pool["replies"]))
+        lp = self._pairs(pre, rep)
+        row = np.asarray(row, int)
+        out = np.zeros(len(turns), float)
+        ess = np.zeros(len(turns), float)
+        for i, pool in enumerate(pools):
+            w, e = snis_weights(lp[row == i], np.asarray(pool["log_q"], float))
+            out[i] = float(w @ np.asarray(pool["sent"], float))
+            ess[i] = e
+        self.last_ess = ess
+        return out
 
     def fit(self, train: Sequence[Turn], dev: Sequence[Turn], cfg: SFTConfig, best_dir: Path,
             augment_levels: int = 2, seed: int = 0, bank: str = "train") -> Dict[str, Any]:
@@ -2447,7 +2711,20 @@ class UserSimulator:
             return self._raw_expected(turns, responses)
         if self.mode == "sample":
             return self._raw_sampled(turns, responses, crn_seed)
+        if self.mode == "pool":
+            return self._raw_pool(turns, responses)
         raise ValueError(f"unknown outcome mode {self.mode}")
+
+    @contextmanager
+    def replicate_pool(self, offset: int = 1):
+        """Temporarily draw from an independent pool (same proposals rule, new seed): the replication
+        null of the shared-pool estimator."""
+        keep = self.pool_seed
+        self.pool_seed = keep + offset
+        try:
+            yield
+        finally:
+            self.pool_seed = keep
 
     def rollout(self, turns: Sequence[Turn], responses: Sequence[str], crn_seed: Optional[int] = None) -> np.ndarray:
         turns = list(turns)
@@ -2474,6 +2751,8 @@ class UserSimulator:
         and any existing calibration cancel exactly in the paired difference, so the raw
         estimator is differenced directly; common random numbers are used in sample mode."""
         turns = list(turns)
+        if self.mode == "pool":
+            self.prepare(turns, list(base))        # pools come from the BASE responses, never the padded ones
         d = self.raw(turns, list(perturbed), crn_seed) - self.raw(turns, list(base), crn_seed)
         lc = InterventionalLengthCalibration().fit(list(base), list(perturbed), d,
                                                    [t.dialogue_id for t in turns], self.logger, seed=seed)
@@ -2685,6 +2964,9 @@ def paired_length_intervention(sim: "UserSimulator", turns: Sequence[Turn], resp
         # The panel expectation is a deterministic function of the prompt: the replication
         # null is identically zero, so it is set exactly instead of paying a full panel sweep.
         y0b = y0.copy()
+    elif sim.mode == "pool":
+        with sim.replicate_pool(1):                # an independent reply pool: the estimator's own noise
+            y0b = sim.outcome(turns, responses, crn_seed=seed + 101)
     else:
         y0b = sim.outcome(turns, responses, crn_seed=seed + 101)
     yA = sim.outcome(turns, longA, crn_seed=seed + 202)
@@ -2712,30 +2994,35 @@ def paired_length_intervention(sim: "UserSimulator", turns: Sequence[Turn], resp
 
 
 def select_outcome_mode(sim: "UserSimulator", turns: Sequence[Turn], logger: logging.Logger,
-                        candidates: Sequence[str] = ("sample", "expected")) -> Dict[str, Any]:
+                        candidates: Sequence[str] = ("pool", "expected", "sample")) -> Dict[str, Any]:
     """Choose the outcome estimator on TRAIN-split labelled turns (never on validation data).
 
-    v15 rule.  The corpus labels are WITHIN-context rankings of counterfactual responses, so the
-    estimator must first of all reproduce its own rankings when re-run on the same responses.  The
-    deterministic panel expectation ("expected") does so by construction; the Monte Carlo estimator
-    ("sample") does not: in the v14 validate run its replication null flipped 34.6% of within-context
-    pairs, 3.5x the pre-registered 10% ceiling, so no invariance gate could pass whatever the length
-    behaviour (tau_corrected was 0 and the TOST passed; only the flip rule failed).  Hence:
-      1. "expected" is selected whenever it is available and its human anchor is positive with a
-         Fisher 95% CI excluding zero;
-      2. otherwise the estimator with the larger human anchor is selected, and a sampled estimator is
-         flagged as unlikely to pass the flip gate.
-    For "sample" the split-half noise (two disjoint halves of the rollouts) is reported, so the
-    choice is documented with the number that motivates it.  v14 maximised the anchor alone.
-    This is a change of the pre-registered selection rule and must be reported as such."""
-    turns = [t for t in turns if t.next_user_text and t.human_valence is not None]
-    if len(turns) < 100:
+    v16 changes, both motivated by the v15 logs:
+      * The anchor is computed like the gate computes it (raw estimate against the ABSOLUTE human label),
+        plus the PARTIAL anchor given the current turn's human label.  v15 correlated (raw - current
+        sentiment), a SHIFT, with an absolute label; that mismatch is why the panel estimator scored
+        0.037 at selection yet 0.51 at the gate.
+      * Eligibility requires within-context reproducibility, measured, not assumed: a second estimate
+        of the same responses from independent randomness (a new reply pool, or new rollouts) must not
+        flip more than max_repl_flip of within-context pairs of the proposals.  The v14/v15 sampled
+        estimator flipped 35.8% and can never pass a 10% flip gate.
+    Rule: among eligible estimators pick the largest PARTIAL anchor whose CI excludes zero; else the
+    largest partial anchor among eligible ones; else the most reproducible estimator.  This is a change
+    of the pre-registered rule and must be reported as such (with the reasons above)."""
+    lab = [t for t in turns if t.next_user_text and t.human_valence is not None]
+    if len(lab) < 100:
         raise ValueError("select_outcome_mode: need >= 100 labelled turns with a next customer turn")
-    gold = [t.gold_response for t in turns]
-    val = np.asarray([t.human_valence for t in turns], float)
-    shift_target = (np.asarray(sim.sentiment([t.next_user_text for t in turns]), float)
-                    - np.asarray(sim.sentiment([t.user_text for t in turns]), float))
-    keep_mode, keep_cv, keep_lc, keep_r = sim.mode, sim.control_variate, sim.length_control, sim.n_rollouts
+    val = np.asarray([t.human_valence for t in lab], float)
+    cur = np.asarray([t.current_valence if t.current_valence is not None else np.nan for t in lab], float)
+    shift_target = (np.asarray(sim.sentiment([t.next_user_text for t in lab]), float)
+                    - np.asarray(sim.sentiment([t.user_text for t in lab]), float))
+    # Reproducibility probe on pairs of REAL agent turns: each context's gold turn and the gold turn of
+    # the next context in the list (a different, fluent reply), both scored in the first context.
+    rp = lab[: min(120, len(lab))]
+    pr_t = [t for t in rp for _ in range(2)]
+    pr_r = [x for a, b in zip(rp, rp[1:] + rp[:1]) for x in (a.gold_response, b.gold_response)]
+    pr_g = np.repeat(np.arange(len(rp)), 2)
+    keep = (sim.mode, sim.control_variate, sim.length_control, sim.n_rollouts, sim.pool_ns)
     sim.control_variate, sim.length_control = None, None
     report: Dict[str, Any] = {}
     try:
@@ -2743,46 +3030,54 @@ def select_outcome_mode(sim: "UserSimulator", turns: Sequence[Turn], logger: log
             if m == "expected" and (sim.panel is None or not sim.panel.calibrated):
                 continue
             sim.mode = m
+            sim.pool_ns = "select"
             try:
-                if m == "sample":
-                    sim.n_rollouts = max(1, keep_r // 2)
-                    r1 = sim.raw(turns, gold, crn_seed=31337)
-                    r2 = sim.raw(turns, gold, crn_seed=41337)
-                    sim.n_rollouts = keep_r
-                    y = 0.5 * (r1 + r2) - np.asarray(sim.sentiment([t.user_text for t in turns]), float)
-                    noise_sd = float(np.std(r1 - r2, ddof=1) / 2.0)       # sd of the full-R estimate
-                    extra = {"deterministic": False, "mc_noise_sd": noise_sd,
-                             "split_half_r": pearson(r1, r2)}
+                y = sim.raw(lab, [t.gold_response for t in lab], crn_seed=31337)
+                if m == "pool":
+                    sim.prepare(pr_t, pr_r)
+                a = sim.raw(pr_t, pr_r, crn_seed=51337)
+                if m == "expected":
+                    b = a
+                elif m == "pool":
+                    with sim.replicate_pool(1):
+                        sim.prepare(pr_t, pr_r)
+                        b = sim.raw(pr_t, pr_r, crn_seed=51337)
                 else:
-                    y = sim.raw(turns, gold, crn_seed=31337) - np.asarray(sim.sentiment([t.user_text for t in turns]), float)
-                    extra = {"deterministic": True, "mc_noise_sd": 0.0, "split_half_r": 1.0}
+                    b = sim.raw(pr_t, pr_r, crn_seed=61337)
             except Exception as e:
                 logger.warning("outcome mode '%s' unavailable: %s", m, e)
                 continue
             rho = spearman(y, val)
-            report[m] = {"human_anchor_rho": rho, "human_anchor_ci95": list(fisher_ci(rho, len(turns))),
-                         "shift_anchor_rho": spearman(y, shift_target), "sd": float(np.std(y)), **extra}
+            pc = partial_spearman(y, val, cur)
+            okp = np.isfinite(cur)
+            report[m] = {"human_anchor_rho": rho, "human_anchor_ci95": list(fisher_ci(rho, len(lab))),
+                         "partial_anchor_rho": pc, "partial_anchor_ci95": list(fisher_ci(pc, int(okp.sum()) - 1)),
+                         "shift_anchor_rho": spearman(y - np.asarray(sim.sentiment([t.user_text for t in lab]), float),
+                                                      shift_target),
+                         "replication_flip": float(_pairwise_flip_rate(a, b, pr_g)) if m != "expected" else 0.0,
+                         "deterministic_given_pool": m in ("expected", "pool"), "sd": float(np.std(y))}
     finally:
-        sim.control_variate, sim.length_control = keep_cv, keep_lc
-        sim.mode, sim.n_rollouts = keep_mode, keep_r
+        sim.mode, sim.control_variate, sim.length_control, sim.n_rollouts, sim.pool_ns = keep
     if not report:
         raise RuntimeError("select_outcome_mode: no usable outcome estimator")
-    ex_ = report.get("expected")
-    if ex_ is not None and math.isfinite(ex_["human_anchor_ci95"][0]) and ex_["human_anchor_ci95"][0] > 0:
-        best, why = "expected", "deterministic and its human anchor CI excludes zero"
+    lim = getattr(sim, "max_repl_flip", 0.10)
+    elig = [m for m, v in report.items() if v["replication_flip"] <= lim]
+    sig = [m for m in elig if math.isfinite(report[m]["partial_anchor_ci95"][0]) and report[m]["partial_anchor_ci95"][0] > 0]
+    pa = lambda m: report[m]["partial_anchor_rho"] if math.isfinite(report[m]["partial_anchor_rho"]) else -2.0
+    if sig:
+        best, why = max(sig, key=pa), "reproducible within context and partial human anchor CI excludes zero"
+    elif elig:
+        best, why = max(elig, key=pa), "reproducible within context; NO estimator has a significant partial anchor"
     else:
-        best = max(report, key=lambda m: (report[m]["human_anchor_rho"]
-                                          if math.isfinite(report[m]["human_anchor_rho"]) else -2.0))
-        why = "largest human anchor (the deterministic estimator is unavailable or carries no human signal)"
-    logger.info("outcome estimator selection on %d TRAIN labelled turns (gold responses):", len(turns))
+        best = min(report, key=lambda m: report[m]["replication_flip"])
+        why = "no estimator is reproducible within context; the most reproducible one is used"
+    logger.info("outcome estimator selection on %d TRAIN labelled turns (gold responses):", len(lab))
     for m, v in report.items():
-        logger.info("  %-9s | human anchor rho=%+.4f CI95[%+.4f,%+.4f] | shift anchor rho=%+.4f | sd=%.4f | "
-                    "Monte Carlo noise sd=%.4f%s", m, v["human_anchor_rho"], *v["human_anchor_ci95"],
-                    v["shift_anchor_rho"], v["sd"], v["mc_noise_sd"], "  <- selected" if m == best else "")
+        logger.info("  %-9s | human anchor %+.4f CI95[%+.4f,%+.4f] | PARTIAL (given current emotion) %+.4f "
+                    "CI95[%+.4f,%+.4f] | replication flip %.3f (limit %.2f) | shift anchor %+.4f%s", m,
+                    v["human_anchor_rho"], *v["human_anchor_ci95"], v["partial_anchor_rho"], *v["partial_anchor_ci95"],
+                    v["replication_flip"], lim, v["shift_anchor_rho"], "  <- selected" if m == best else "")
     logger.info("  rule: %s", why)
-    if best == "sample":
-        logger.warning("the SAMPLED estimator was selected: its own Monte Carlo noise flips within-context "
-                       "rankings, so the flip gate is expected to fail. Increase --sim-rollouts or fix the panel.")
     report["selected"] = best
     report["rule"] = why
     return report
@@ -2805,6 +3100,11 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
     n = len(turns)
     if n < 30:
         raise ValueError("validate_simulator: need >= 30 contexts with a next customer turn")
+    prompts = [agent_prompt(t) for t in turns for _ in range(n_variants)]
+    variants = proposal.generate(prompts, gen, seed=202)
+    flat = [t for t in turns for _ in range(n_variants)]
+    if sim.mode == "pool":
+        sim.prepare(flat, variants)                # pools from gold + the variants, before anything is scored
     y_gold = sim.rollout(turns, [t.gold_response for t in turns], crn_seed=101)
     y_real = (np.asarray(sim.sentiment([t.next_user_text for t in turns]), float)
               - np.asarray(sim.sentiment([t.user_text for t in turns]), float))
@@ -2814,10 +3114,17 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
     human_n = int(ok.sum())
     gold_L = loglen([t.gold_response for t in turns])
     rho_len_label = spearman(gold_L[ok], val[ok]) if human_n >= 20 else float("nan")
+    # v16: the PARTIAL human anchor, conditioning on the human label of the CURRENT customer turn.  The
+    # absolute anchor is inflated by emotional carry-over (an angry customer stays angry whatever the
+    # agent says), which an outcome can track without responding to the agent at all.
+    cur_val = np.asarray([t.current_valence if t.current_valence is not None else np.nan for t in turns], float)
+    okp = ok & np.isfinite(cur_val)
+    pcl = np.asarray([t.dialogue_id for t in turns])[okp]
+    yp, vp, cp = y_gold[okp], val[okp], cur_val[okp]
+    p_pt, p_lo, p_hi = (cluster_bootstrap_ci(lambda ix: partial_spearman(yp[ix], vp[ix], cp[ix]), pcl, n_boot, seed + 9)
+                        if int(okp.sum()) >= 30 else (float("nan"),) * 3)
+    carry = spearman(cp, vp) if int(okp.sum()) >= 30 else float("nan")
 
-    prompts = [agent_prompt(t) for t in turns for _ in range(n_variants)]
-    variants = proposal.generate(prompts, gen, seed=202)
-    flat = [t for t in turns for _ in range(n_variants)]
     gid = np.repeat(np.arange(n), n_variants)
     cluster = np.asarray([t.dialogue_id for t in flat])
     if sim.mode == "expected":
@@ -2825,6 +3132,14 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
         r2 = r1
         logger.info("expected-outcome mode | the estimator is a deterministic panel expectation, so the "
                     "split-half replicate is exact and Monte Carlo variance is zero by construction")
+    elif sim.mode == "pool":
+        r1 = sim.outcome(flat, variants, crn_seed=303)
+        ess1 = sim.last_ess.copy()
+        with sim.replicate_pool(1):
+            r2 = sim.outcome(flat, variants, crn_seed=404)
+        logger.info("shared-pool estimator | two independent reply pools per context | importance-sampling ESS "
+                    "median %.1f of %d (10th pct %.1f)", float(np.median(ess1)), sim.pool_size,
+                    float(np.quantile(ess1, 0.1)))
     else:
         full = sim.n_rollouts
         half = max(1, full // 2)
@@ -2849,6 +3164,13 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
     if sim.mode == "expected":
         icc: Optional[float] = None
         reliability: Optional[float] = None
+    elif sim.mode == "pool":
+        # Replicate = an independent pool.  What matters is within-context reproducibility: the share of
+        # within-context variance that survives re-drawing the pool, and the replication flip rate.
+        dr = (r1 - r2).reshape(n, n_variants)
+        var_pool = float(np.mean(dr.var(1, ddof=1)) / 2.0) if n_variants > 1 else 0.0
+        icc = float(max(0.0, min(1.0, 1.0 - var_pool / max(var_within_ctx, EPS))))
+        reliability = float(_pairwise_flip_rate(r1, r2, np.repeat(np.arange(n), n_variants)))
     else:
         var_repl = float(np.mean((r1 - r2) ** 2) / 2.0)
         icc = float(max(0.0, min(1.0, (var_within_ctx - var_repl / 2.0) / max(var_within_ctx, EPS))))
@@ -2902,6 +3224,10 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
         fails.append(f"only {human_n} turns carry a human emotion label")
     elif not math.isfinite(a_lo) or a_lo <= 0.0:
         fails.append(f"human-label anchor rho={a_pt:+.4f} clustered CI[{a_lo:+.4f},{a_hi:+.4f}] does not exclude zero")
+    if math.isfinite(p_lo) and p_lo <= 0.0:
+        warns.append(f"PARTIAL human anchor (given the current turn's emotion) rho={p_pt:+.4f} CI[{p_lo:+.4f},"
+                     f"{p_hi:+.4f}] does not exclude zero: the absolute anchor {a_pt:+.3f} is then explained by "
+                     f"emotional carry-over (current vs next human label rho={carry:+.3f}), not by the response")
     if math.isfinite(lo_b) and math.isfinite(hi_b) and lo_b * hi_b > 0 and min(abs(lo_b), abs(hi_b)) > max_within_length_rho:
         direction = "brevity" if pt < 0 else "verbosity"
         fails.append(f"the outcome tracks length within context at rho={pt:+.3f} CI[{lo_b:+.3f},{hi_b:+.3f}] "
@@ -2943,12 +3269,18 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
     gate_arrays = intervention.pop("_arrays", None)
     out = {
         "n_turns": n, "n_variants": n_variants, "_gate_arrays": gate_arrays,
+        "human_label_partial_rho": float(p_pt), "human_label_partial_ci_clustered": [p_lo, p_hi],
+        "human_label_partial_n": int(okp.sum()), "human_carryover_rho": float(carry),
+        "outcome_mode": sim.mode,
         "anchor_spearman": float(rho_shift), "anchor_ci": list(fisher_ci(rho_shift, n)),
         "human_label_rho": float(a_pt), "human_label_ci_clustered": [a_lo, a_hi], "human_label_n": human_n,
         "length_predicts_human_label_rho": float(rho_len_label),
         "responsiveness_icc": icc, "replicate_reliability": reliability,
         "icc_note": ("not applicable: the panel estimator is deterministic, so the replicate equals the "
-                     "estimate and ICC = reliability = 1 by construction" if icc is None else "split-half"),
+                     "estimate and ICC = reliability = 1 by construction" if icc is None else
+                     ("pool: ICC = share of within-context variance that survives an independent reply pool; "
+                      "replicate_reliability = within-context flip rate between the two pools (lower is better)"
+                      if sim.mode == "pool" else "split-half")),
         "response_variance_share": response_share, "var_within_context": var_within_ctx,
         "var_between_context": var_between_ctx,
         "length_rho_within_before": w_before["mean"], "length_rho_within_after": w_after["mean"],
@@ -2965,6 +3297,8 @@ def validate_simulator(sim: UserSimulator, turns: Sequence[Turn], proposal, n_va
         "passes": False, "failures": fails, "warnings": warns,
     }
     out["passes"] = len(fails) == 0
+    logger.info("simulator | human anchor PARTIAL on the current turn's emotion rho=%+.4f CI[%+.4f,%+.4f] (n=%d; "
+                "carry-over current->next %+.3f)", p_pt, p_lo, p_hi, int(okp.sum()), carry)
     logger.info("simulator | shift anchor rho=%.4f | human anchor rho=%+.4f CI[%+.4f,%+.4f] | ICC %s | "
                 "within-context share of outcome variance %.3f | observational within-context length rho %+.3f "
                 "CI[%+.3f,%+.3f] (no post-hoc residualisation; human label vs length rho %+.3f) | pass=%s",
@@ -4012,6 +4346,8 @@ class Config:
     human_validity_pairs: int = 200         # R3: within-context simulator-validity items
     human_overlap: float = 0.3              # R3: share of items annotated twice (for agreement)
     human_comparisons: Tuple[str, ...] = ("caro:sft", "caro:sentiment_only", "caro:dpo")
+    pool_size: int = 32                     # v16: simulated customer replies per context (shared-pool estimator)
+    pool_proposals: int = 4                 # v16: proposal agent turns per pool (gold + up to 3 candidates)
     stability_safety: float = 0.8           # v15: FIT-half flip limit = this x max_abs_flip when choosing T (0 = off)
     sim_train_bank: str = "train"           # v15: filler bank for the simulator's invariance regulariser
     noninferiority_info_margin: float = 0.05   # D4: information-retention non-inferiority margin (recall units)
@@ -4105,11 +4441,8 @@ class Experiment:
                 pj = LogitNullspaceProjector.load(st)
         ob = self.cfg.out / "orbit.json"
         n_orbit = int(load_json(ob).get("n_orbit", 1)) if ob.exists() else self.cfg.orbit_levels
-        sim = UserSimulator(policy, self.sentiment, self.logger,
-                            rollouts if rollouts is not None else self.cfg.sim_rollouts,
-                            mode=mode, panel=self.panel(policy),
-                            panel_temperature=self.cfg.panel_temperature,
-                            projector=pj, n_orbit=n_orbit)
+        sim = self.make_sim(policy, mode, rollouts)
+        sim.projector, sim.n_orbit = pj, n_orbit
         if pj is not None:
             self.logger.info("loaded logit nullspace projector | k=%d | residual length-perturbation "
                              "energy %.4f | signal retained %.4f | orbit levels=%d", pj.k,
@@ -4128,6 +4461,18 @@ class Experiment:
             sim.control_variate = FrozenControlVariate.load(load_json(g))
         return sim
 
+    def make_sim(self, policy, mode: str, rollouts: Optional[int] = None) -> "UserSimulator":
+        """Every simulator shares the run's persistent reply-pool store."""
+        if getattr(self, "_pool_store", None) is None:
+            self._pool_store = ReplyPoolStore(self.cfg.out / "reply_pools.jsonl")
+        sim = UserSimulator(policy, self.sentiment, self.logger,
+                            rollouts if rollouts is not None else self.cfg.sim_rollouts, mode=mode,
+                            panel=self.panel(policy) if self.cfg.outcome_mode in ("auto", "expected") else None,
+                            panel_temperature=self.cfg.panel_temperature, pool_store=self._pool_store,
+                            pool_size=self.cfg.pool_size, pool_proposals=self.cfg.pool_proposals)
+        sim.max_repl_flip = self.cfg.max_abs_flip
+        return sim
+
     def sim_train_bank(self) -> str:
         """Filler bank the simulator in cfg.out was regularised on.  Simulators trained before v15 carry
         no record and used the courtesy bank."""
@@ -4138,7 +4483,7 @@ class Experiment:
         """Build and calibrate the outcome panel and select the estimator if that has not been done for
         this simulator.  Selection uses only TRAIN-split turns, so it cannot see the validation gate."""
         cfg = self.cfg
-        if cfg.outcome_mode != "sample":
+        if cfg.outcome_mode in ("auto", "expected"):
             panel = self.panel(sim_pol)
             if panel is not None and not panel.calibrated:
                 cal = filter_turns(self.turns, "train", require_next=True, limit=1200, seed=cfg.seed + 11,
@@ -4149,8 +4494,7 @@ class Experiment:
         if cfg.outcome_mode == "auto" and not f.exists():
             sel_turns = filter_turns(self.turns, "train", require_next=True, require_label=True, limit=400,
                                      seed=cfg.seed + 13, logger=self.logger, what="estimator selection turns")
-            probe = UserSimulator(sim_pol, self.sentiment, self.logger, cfg.sim_rollouts, mode="sample",
-                                  panel=self.panel(sim_pol), panel_temperature=cfg.panel_temperature)
+            probe = self.make_sim(sim_pol, "sample")
             dump_json(select_outcome_mode(probe, sel_turns, self.logger), f)
         return load_json(f)["selected"] if cfg.outcome_mode == "auto" else cfg.outcome_mode
 
@@ -4183,7 +4527,7 @@ def stage_simulator(cfg: Config) -> Dict[str, Any]:
     # A retrained simulator invalidates every artefact that was fitted on the old one.
     for stale in ("panel_cal_cache.npz", "outcome_panel.json", "logit_projector.json", "length_control.json",
                   "control_variate.json", "orbit.json", "simulator_validation.json", "validation_gate_sample.npz",
-                  "invariance_selection.json"):
+                  "invariance_selection.json", "reply_pools.jsonl"):
         f = cfg.out / stale
         if f.exists():
             f.unlink()
@@ -4333,6 +4677,7 @@ def stage_validate(cfg: Config) -> Dict[str, Any]:
     sim_pol = ex.policy_with("simulator")
     selected = ex.ensure_estimator(sim_pol)       # v15: never fall back silently to the sampled estimator
     sim = ex.simulator(sim_pol, load_nuisance=False)
+    sim.pool_ns = "validate"
     sim.length_control = None
     sim.projector = None
     sim.control_variate = None
@@ -4484,6 +4829,7 @@ def stage_corpus(cfg: Config) -> Dict[str, Any]:
                                f"{VERSION} validation gate (use --no-strict only for debugging)")
     sim_pol = ex.policy_with("simulator")
     sim = ex.simulator(sim_pol, cfg.sim_rollouts_corpus)
+    sim.pool_ns = "corpus"
     prop = ex.policy_with("sft_policy")
     tr = filter_turns(ex.turns, "train", require_next=True, limit=cfg.corpus_contexts, seed=cfg.seed + 1,
                       logger=ex.logger, what="corpus contexts")
@@ -4682,6 +5028,7 @@ def stage_eval(cfg: Config, arm: str, seed: int) -> Dict[str, Any]:
     pol = ex.policy_with(adapter)
     sim_pol = ex.policy_with("simulator")
     sim = ex.simulator(sim_pol)
+    sim.pool_ns = "eval"        # one pool per test context, shared by every arm and seed (first arm = sft)
     te = filter_turns(ex.turns, "test", require_next=True, limit=cfg.eval_turns, seed=cfg.seed,
                       logger=ex.logger, what="evaluation turns")
     gen = ex.gen(0.7)
@@ -5070,10 +5417,12 @@ _CELL_KEYS = ("delta_mean", "delta_ci90", "equivalence_margin", "tost_passes", "
 
 def _correction_cells(flat, base, padded: Dict[str, Tuple[List[str], List[str], List[str]]], raw, obs, h_int,
                       gid, cluster, cfg: "Config", mode: str, sample: str, simulator: str,
-                      logger: logging.Logger) -> List[Dict[str, Any]]:
+                      logger: logging.Logger, raw_rep=None) -> List[Dict[str, Any]]:
     """Cross {none, v8 observational, v12 interventional} with the filler banks on ONE set of responses.
-    `raw(texts)` returns the outcome WITHOUT any length correction."""
+    `raw(texts)` returns the outcome WITHOUT any length correction; `raw_rep`, when given, re-estimates it
+    from independent randomness (the replication null of a stochastic estimator)."""
     y0 = raw(base)
+    y0r = raw_rep(base) if raw_rep is not None else y0
     cells = []
     for bank, (longer, longA, longB) in padded.items():
         y1, yA, yB = raw(longer), raw(longA), raw(longB)
@@ -5083,7 +5432,7 @@ def _correction_cells(flat, base, padded: Dict[str, Tuple[List[str], List[str], 
             if name == "v12_interventional" and not fn.fitted:
                 continue
             ap = (lambda tx, yy: yy) if fn is None else (lambda tx, yy, f=fn: f.apply(tx, yy))
-            st = intervention_stats(ap(base, y0), ap(longer, y1), ap(base, y0), ap(longA, yA), ap(longB, yB),
+            st = intervention_stats(ap(base, y0), ap(longer, y1), ap(base, y0r), ap(longA, yA), ap(longB, yB),
                                     gid=gid, cluster=cluster, seed=cfg.seed + 3,
                                     margin_frac=cfg.length_margin_frac, max_tau=cfg.max_tau,
                                     max_excess_flip=cfg.max_excess_flip, max_abs_flip=cfg.max_abs_flip,
@@ -5111,6 +5460,7 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
     """All ablation cells for the simulator whose artefacts live in cfg.out."""
     sim_pol = ex.policy_with("simulator")
     sim = ex.simulator(sim_pol)                     # frozen projector / temperature / h(L) / control variate
+    sim.pool_ns = "validate"                        # the gate replica must re-use the gate's pools
     h_int = sim.length_control
     sim.length_control = None                        # raw outcomes; corrections are applied afterwards
     turn_of = {t.uid: t for t in ex.turns}
@@ -5128,6 +5478,11 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
         padded = {"heldout": ([str(x) for x in z["longer"]], [str(x) for x in z["longA"]], [str(x) for x in z["longB"]])}
         padded.update(_pad_sets(base, [b for b in (ex.sim_train_bank(), FIT_BANK) if b != "heldout"], cfg.seed + 3))
         raw = lambda tx, fl=flat: sim.rollout(fl, list(tx), crn_seed=cfg.seed + 3)
+
+        def raw_rep(tx, fl=flat):
+            with sim.replicate_pool(1):
+                return sim.rollout(fl, list(tx), crn_seed=cfg.seed + 104)
+        rr = raw_rep if sim.mode == "pool" else None
         y0r = raw(base)
         y1r = raw(padded["heldout"][0])
         if h_int is not None and h_int.fitted:
@@ -5144,7 +5499,7 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
         # the v8 observational control is fitted on the dialogue-disjoint FIT half, as v8 did
         obs = _fit_observational(cfg, ex, sim, prop)
         cells += _correction_cells(flat, base, padded, raw, obs, h_int, gid, cl, cfg, sim.mode, "gate_replica",
-                                   label, ex.logger)
+                                   label, ex.logger, raw_rep=rr)
     else:
         ex.logger.warning("[%s] no validation_gate_sample.npz (written by the v14 validate stage); the gate "
                           "replica is skipped", label)
@@ -5177,9 +5532,15 @@ def _ablate_one_simulator(cfg: "Config", ex: "Experiment", label: str, prop) -> 
     gid = np.repeat(np.arange(len(te)), k)
     cl = np.asarray([t.dialogue_id for t in flat])
     raw = lambda tx, fl=flat: sim.rollout(fl, list(tx), crn_seed=4321)
+    if sim.mode == "pool":
+        sim.prepare(flat, base)
+
+    def raw_rep2(tx, fl=flat):
+        with sim.replicate_pool(1):
+            return sim.rollout(fl, list(tx), crn_seed=4425)
     padded = _pad_sets(base, list(dict.fromkeys([ex.sim_train_bank(), FIT_BANK, "heldout"])), 911)
     cells += _correction_cells(flat, base, padded, raw, obs, h_int, gid, cl, cfg, sim.mode, "independent", label,
-                               ex.logger)
+                               ex.logger, raw_rep=(raw_rep2 if sim.mode == "pool" else None))
     arrays.update({"y0": raw(base), "gid": gid, "cluster": np.asarray([str(c) for c in cl])})
     for bank, (longer, longA, longB) in padded.items():
         arrays[f"y1_{bank}"], arrays[f"yA_{bank}"], arrays[f"yB_{bank}"] = raw(longer), raw(longA), raw(longB)
@@ -5968,6 +6329,12 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
                                    "not supported"),
         None if not sv else {"rho": sv.get("human_label_rho"), "ci95": sv.get("human_label_ci_clustered"),
                              "n": sv.get("human_label_n")})
+    add("partial_anchor", "the simulator's outcome tracks the next-turn human emotion BEYOND the current turn's emotion "
+        "(partial correlation; excludes emotional carry-over)",
+        "untested" if not sv or "human_label_partial_ci_clustered" not in sv else
+        ("supported" if (sv["human_label_partial_ci_clustered"][0] or 0) > 0 else "not supported"),
+        None if not sv else {"rho": sv.get("human_label_partial_rho"), "ci95": sv.get("human_label_partial_ci_clustered"),
+                             "carry_over_rho": sv.get("human_carryover_rho"), "estimator": sv.get("outcome_mode")})
     g = rw.get("gate", {})
     anc = g.get("gold_anchor", {})
     add("reward_human_signal", f"the reward carries human-anchored signal (gold anchor >= "
@@ -6147,6 +6514,10 @@ def stage_paper(cfg: Config) -> Dict[str, Any]:
         obj.append(["C2: rho(gold outcome, human label), between contexts", sv.get("human_label_rho"),
                     "[{:+.3f},{:+.3f}]".format(*sv.get("human_label_ci_clustered", [float("nan")] * 2)), "--",
                     f"n={sv.get('human_label_n')}"])
+    if sv.get("human_label_partial_ci_clustered"):
+        obj.append(["C2': same, PARTIAL on the current turn's human emotion", sv.get("human_label_partial_rho"),
+                    "[{:+.3f},{:+.3f}]".format(*sv["human_label_partial_ci_clustered"]), "--",
+                    f"carry-over rho={sv.get('human_carryover_rho', float('nan')):+.3f}"])
     for key_, lab in (("caro_vs_sft:outcome", "C3: delta outcome (simulator)"),
                       ("caro_vs_sentiment_only:outcome", "C3: vs sentiment-only"),
                       ("caro_vs_dpo:outcome", "C3: vs DPO"), ("caro_vs_sft_lenmatch:outcome", "C3: vs length-matched SFT"),
@@ -6380,6 +6751,8 @@ _FLAGS: List[Tuple[str, str, Any, str]] = [
     ("--external-rollouts", "external_rollouts", int, ""),
     ("--human-contexts", "human_contexts", int, ""), ("--human-validity-pairs", "human_validity_pairs", int, ""),
     ("--noninferiority-info-margin", "noninferiority_info_margin", float, ""),
+    ("--pool-size", "pool_size", int, "replies per context for the shared-pool estimator"),
+    ("--pool-proposals", "pool_proposals", int, "proposal agent turns per reply pool (gold included)"),
     ("--stability-safety", "stability_safety", float, "FIT-half flip limit as a fraction of --max-abs-flip "
                                                       "when choosing the panel temperature (0 disables)"),
     ("--cross-eval-contexts", "cross_eval_contexts", int, "held-out contexts for cross-evaluator agreement"),
@@ -6419,7 +6792,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--seeds", type=int, nargs="+", default=list(d.seeds))
     p.add_argument("--arm", default=None)
     p.add_argument("--arms", nargs="+", default=list(d.arms), choices=list(KNOWN_ARMS))
-    p.add_argument("--outcome-mode", default=d.outcome_mode, choices=["auto", "expected", "sample"])
+    p.add_argument("--outcome-mode", default=d.outcome_mode, choices=["auto", "pool", "expected", "sample"])
     p.add_argument("--sim-train-bank", default=d.sim_train_bank, choices=["train", "courtesy_v13"],
                    help="filler bank the simulator is regularised on; courtesy_v13 reproduces pre-v15 simulators")
     p.add_argument("--gate-bank", default=d.gate_bank, choices=sorted(FILLER_BANKS),
@@ -6574,6 +6947,34 @@ def _unit_tests() -> None:
     assert info_recall("Booked at the Gonville, ref XYZ123.", "Your Gonville booking is done, reference XYZ123.") > 0.3
     assert info_recall("So sorry, glad to help!", "Your Gonville booking is done, reference XYZ123.") == 0.0
     assert math.isnan(info_recall("Hello.", "Thank you, goodbye!"))
+    # (10) Shared-pool MIS estimator: on a toy simulator with known reply distributions the balance-heuristic
+    #      SNIS estimate recovers E_p(.|r)[s] for a response that is NOT a proposal, and two responses scored
+    #      on the same pool are ranked far more reproducibly than with independent Monte Carlo draws.
+    r10 = np.random.default_rng(10)
+    V = 30
+    s10 = r10.normal(size=V)
+    # responses to ONE context induce similar reply distributions: a shared context term plus a smaller
+    # response-specific perturbation (with fully unrelated rows the advantage shrinks, as theory predicts)
+    logits = r10.normal(size=(1, V)) * 1.5 + r10.normal(size=(4, V)) * 0.5
+    P = np.exp(logits) / np.exp(logits).sum(1, keepdims=True)          # rows: 3 proposals + 1 target
+    truth = P[3] @ s10
+    est = []
+    for _ in range(300):
+        draws = np.concatenate([r10.choice(V, 20, p=P[m]) for m in range(3)])
+        log_q = np.log(P[:3, draws].mean(0))
+        w, _ = snis_weights(np.log(P[3, draws]), log_q)
+        est.append(float(w @ s10[draws]))
+    assert abs(np.mean(est) - truth) < 0.05, (np.mean(est), truth)
+    flips_pool = flips_ind = 0
+    for _ in range(300):
+        dr = [np.concatenate([r10.choice(V, 20, p=P[m]) for m in range(3)]) for _ in range(2)]
+        e = [[float(snis_weights(np.log(P[k, d]), np.log(P[:3, d].mean(0)))[0] @ s10[d]) for k in (2, 3)] for d in dr]
+        flips_pool += int((e[0][0] - e[0][1]) * (e[1][0] - e[1][1]) < 0)
+        ind = [[float(s10[r10.choice(V, 20, p=P[k])].mean()) for k in (2, 3)] for _ in range(2)]
+        flips_ind += int((ind[0][0] - ind[0][1]) * (ind[1][0] - ind[1][1]) < 0)
+    assert flips_pool < 0.7 * flips_ind, (flips_pool, flips_ind)
+    print(f"unit tests OK | shared-pool estimator: mean {np.mean(est):+.3f} vs truth {truth:+.3f} | replication "
+          f"flips {flips_pool}/300 on a shared pool vs {flips_ind}/300 with independent draws")
     # (9) Stability-constrained temperature: an inadmissible optimum must not be chosen, and an empty
     #     admissible set must fall back to the unconstrained optimum (reported, never silently widened).
     r9 = np.random.default_rng(9)
@@ -6657,7 +7058,10 @@ def run_selftest() -> None:
     assert sa["replica"]["available"] and sa["replica"]["reproduces_gate"], f"gate replica failed: {sa['replica']}"
     assert sa["variants_per_context"] == cfg.validate_variants
     sv0 = load_json(cfg.out / "simulator_validation.json")
-    assert sv0["responsiveness_icc"] is None and sv0["replicate_reliability"] is None or sv0.get("icc_note") == "split-half"
+    assert (sv0["responsiveness_icc"] is None) == (sv0["outcome_mode"] == "expected"), "ICC must be n/a exactly when deterministic"
+    assert math.isfinite(sv0["human_label_partial_rho"]), "partial human anchor missing"
+    if sv0["outcome_mode"] == "pool":
+        assert (cfg.out / "reply_pools.jsonl").exists(), "reply pools were not persisted"
     sen = load_json(cfg.out / "sensitivity.json")
     assert any(g["selected"] for g in sen["reward_regularisation"]), "the selected reward cell is not in the grid"
     abr = load_json(cfg.out / "ablation_reward.json")
@@ -6834,6 +7238,7 @@ def stage_cross_eval(cfg: "Config") -> Dict[str, Any]:
     del sft
     _release_gpu()
     sim = ex.simulator(ex.policy_with("simulator"))
+    sim.pool_ns = "cross"
     y_sim = np.asarray(sim.rollout(flat_t, responses, crn_seed=seed0), float)
     del sim
     _release_gpu()
