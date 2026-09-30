@@ -1,0 +1,11 @@
+07:27:01 INFO    CARO v16 | tag=7_eval_sft_lenmatch_42 | device=cuda | out=/home/tahir/RL-LLM/caro_run_v16 | stub=False | seeds=(42,)
+07:27:01 INFO    loaded 82768 cached turns from /home/tahir/RL-LLM/caro_run_v16/turns.json
+07:27:11 INFO    policy Qwen2.5-3B-Instruct | LoRA r=16 | trainable 29.93M / 1728.61M (1.732%) | 4bit=True
+07:27:11 INFO    loaded adapter from /home/tahir/RL-LLM/caro_run_v16/sft_policy (504 tensors into the live adapter)
+07:27:16 INFO    policy Qwen2.5-3B-Instruct | LoRA r=16 | trainable 29.93M / 1728.61M (1.732%) | 4bit=True
+07:27:16 INFO    loaded adapter from /home/tahir/RL-LLM/caro_run_v16/simulator (504 tensors into the live adapter)
+07:27:19 INFO    sentiment model ready | labels={0: 'negative', 1: 'neutral', 2: 'positive'} | pos=2 neg=0
+07:27:19 INFO    loaded interventional length calibration | {'n_pairs': 1200, 'mean_delta_raw': -0.0022206864421308726, 'mean_delta_residual_cross_fitted': -0.00016984385405240457}
+07:27:19 INFO      selected 800 evaluation turns (split=test, require_next=True, 120 dialogues)
+07:35:38 INFO    fast panel scoring verified in outcome units | max |dO|=0.00159 vs reference-path self-disagreement 0.00508 (tolerance 0.01525) | centred-logit max |diff|=0.1539 nats | logits kwarg='logits_to_keep' | score batch 64
+08:06:02 INFO    eval sft_lenmatch seed=42 | 800 turns | outcome 0.0860+-0.1579 | words 43.0 | hygiene 0.875 | info recall 0.323 (782 turns with salient gold tokens)
