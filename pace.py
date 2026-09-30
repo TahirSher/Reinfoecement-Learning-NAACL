@@ -364,10 +364,10 @@ VERSION = "pace-1"
 COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "pace-1")   # stage-3/4/5 artefacts from v9 onwards remain valid
 
 # Arms that are optimised (need a train stage) versus arms that only re-use the SFT adapter.
-TRAINED_ARMS = ("pace", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo",
+TRAINED_ARMS = ("pace", "pace_dpo_init", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo",
                 "sentiment_only", "dpo", "caro", "caro_no_abstain")
 EVAL_ONLY_ARMS = ("sft", "sft_bon_sim", "sft_bon_rm", "sft_lenmatch")
-NEEDS_REWARD_MODEL = ("dpo", "caro", "caro_no_abstain", "sft_bon_rm", "sft_lenmatch")
+NEEDS_REWARD_MODEL = ("dpo", "pace_dpo_init", "caro", "caro_no_abstain", "sft_bon_rm", "sft_lenmatch")
 PRIMARY_ARMS = ("pace", "caro")          # the first one present is the method under test
 KNOWN_ARMS = TRAINED_ARMS + EVAL_ONLY_ARMS
 
@@ -4363,7 +4363,7 @@ def train_grpo(policy, reward_fn, turns: Sequence[Turn], cfg: GRPOConfig, gen: G
 REWRITE_INSTRUCTION = ("You are a customer service agent. Improve the draft reply so that the customer feels heard "
                        "and respected. Keep every fact, number, name and request from the draft, do not add new "
                        "facts, and keep it about the same length. Write only the improved reply.")
-PACE_ARMS = ("pace", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo")
+PACE_ARMS = ("pace", "pace_dpo_init", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo")
 
 
 @dataclass
@@ -4526,6 +4526,10 @@ def train_pace(ex: "Experiment", cfg: "Config", arm: str, seed: int) -> Dict[str
     tag = f"{arm}_s{seed}"
     seed_everything(seed)
     pol = ex.policy_with("sft_policy")
+    ref = pol.snapshot_trainable()               # the SFT weights: DPO reference AND the baseline of every test
+    if arm == "pace_dpo_init":
+        # offline-to-online: start from the offline DPO policy, keep SFT as reference and baseline
+        pol.load_adapter(cfg.out / f"policy_dpo_s{seed}")
     sim = ex.simulator(ex.policy_with("simulator"))
     sim.pool_size = pc.pool_size
     monitor = None
@@ -4534,7 +4538,6 @@ def train_pace(ex: "Experiment", cfg: "Config", arm: str, seed: int) -> Dict[str
     if sim.mode != "pool":
         lg.warning("%s | the certified estimator is '%s', not the shared pool: preferences lose their common "
                    "random numbers and the monitor labeller is unavailable", tag, sim.mode)
-    ref = pol.snapshot_trainable()
     accepted = pol.snapshot_trainable()
     rng = random.Random(seed)
     pool_tr = filter_turns(ex.turns, "train", seed=seed, limit=pc.rounds * pc.contexts_per_round + 1000)
@@ -4562,6 +4565,15 @@ def train_pace(ex: "Experiment", cfg: "Config", arm: str, seed: int) -> Dict[str
 
     beta, lr = pc.beta, pc.lr
     best_gain, rejections, n_acc = 0.0, 0, 0
+    init_gain = None
+    if arm == "pace_dpo_init":
+        # the starting policy is not SFT: measure it on the same dev pools, so every round must beat IT
+        dev_init = pol.generate([agent_prompt(t) for t in dev], evalg, seed=seed * 7 + 1)
+        ji = _pace_judge(sim, dev, dev_init, monitor)
+        init_gain = float(np.mean(ji["A"] - j0["A"]))
+        best_gain = max(0.0, init_gain)
+        lg.info("%s | initial (offline DPO) policy on dev: affect gain over SFT %+.4f; rounds must exceed it",
+                tag, init_gain)
     sigma = float("nan")
     hist: List[Dict[str, Any]] = []
     alpha_r = pc.alpha / max(1, pc.rounds)
@@ -4663,13 +4675,16 @@ def train_pace(ex: "Experiment", cfg: "Config", arm: str, seed: int) -> Dict[str
             break
     pol.restore_trainable(accepted)
     if flags["hcpi"] and n_acc == 0:
-        lg.warning("%s | no round passed the high-confidence acceptance test: the returned policy IS the SFT "
-                   "policy. That is the algorithm working as designed, not a crash: report it.", tag)
+        lg.warning("%s | no round passed the high-confidence acceptance test: the returned policy IS the %s "
+                   "policy. That is the algorithm working as designed, not a crash: report it.", tag,
+                   "initial (offline DPO)" if arm == "pace_dpo_init" else "SFT")
     if cfg.stub and hasattr(pol, "_adapter"):
         pol._adapter = {**pol._adapter, "tag": pol._adapter.get("tag", "") + f"|{tag}"}
     pol.save_adapter(cfg.out / f"policy_{tag}")
     return {"arm": arm, "seed": seed, "flags": flags, "rounds": hist, "accepted_rounds": n_acc,
-            "returned_sft": bool(flags["hcpi"] and n_acc == 0), "sigma": sigma, "config": asdict(pc)}
+            "returned_sft": bool(flags["hcpi"] and n_acc == 0 and arm != "pace_dpo_init"),
+            "returned_initial": bool(flags["hcpi"] and n_acc == 0), "initial_dev_gain": init_gain,
+            "sigma": sigma, "config": asdict(pc)}
 
 
 def eval_gen_seed(seed: int, offset: int, draw: int = 0) -> int:
@@ -4778,7 +4793,8 @@ class Config:
     corpus_temperature: float = 1.0
     eval_turns: int = 800
     strict: bool = True
-    arms: Tuple[str, ...] = ("sft", "sentiment_only", "online_dpo", "pace", "sft_bon_sim")
+    # dpo is the strongest baseline measured so far (it beat CARO on affect AND information), so it is a default
+    arms: Tuple[str, ...] = ("sft", "sentiment_only", "dpo", "online_dpo", "pace", "pace_dpo_init", "sft_bon_sim")
     dpo: DPOConfig = field(default_factory=DPOConfig)
     pace: PACEConfig = field(default_factory=PACEConfig)
     bon_n: int = 4                           # samples per context for sft_bon_rm and sft_lenmatch
@@ -5562,6 +5578,8 @@ def comparison_plan(arms: Sequence[str]) -> List[Tuple[str, str]]:
     primary = next((a for a in PRIMARY_ARMS if a in arms), None)
     if primary is not None:
         plan += [(primary, a) for a in arms if a not in ("sft", primary)]
+    if "pace_dpo_init" in arms and "dpo" in arms:
+        plan.append(("pace_dpo_init", "dpo"))       # does online PACE add to the best offline method?
     return plan
 
 
@@ -6784,7 +6802,9 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
                        (f"{P}_vs_pace_no_rewrite:outcome", "content-anchored rewrite exploration contributes"),
                        (f"{P}_vs_pace_no_pareto:outcome", "noise-calibrated Pareto pairs contribute"),
                        (f"{P}_vs_pace_no_hcpi:outcome", "the acceptance test does not cost affect"),
-                       (f"{P}_vs_dpo:outcome", "online RL beats offline DPO on the reward corpus"),
+                       (f"{P}_vs_dpo:outcome", "PACE beats offline DPO on the reward corpus (the strongest baseline "
+                                               "in the CARO runs)"),
+                       ("pace_dpo_init_vs_dpo:outcome", "online PACE rounds add to the offline DPO policy"),
                        (f"{P}_vs_sft_bon_rm:outcome", "RL adds beyond best-of-N reranking with the learnt reward"),
                        (f"{P}_vs_sft_lenmatch:outcome", "the gain is not explained by response length "
                                                         "(design-based length-matched SFT control)")):
@@ -7132,7 +7152,9 @@ def ordered_arms(arms: Sequence[str]) -> List[str]:
     unknown = [a for a in arms if a not in KNOWN_ARMS]
     if unknown:
         raise ValueError(f"unknown arms {unknown}; choose from {KNOWN_ARMS}")
-    return sorted(arms, key=lambda a: (a == "sft_lenmatch", a == "sft_bon_rm", a not in ("sft",)))
+    if "pace_dpo_init" in arms and "dpo" not in arms:
+        raise ValueError("arm pace_dpo_init starts from the dpo arm's policy: add dpo to --arms")
+    return sorted(arms, key=lambda a: (a == "sft_lenmatch", a == "sft_bon_rm", a == "pace_dpo_init", a not in ("sft",)))
 
 
 def stage_all(cfg: Config) -> None:
@@ -7600,6 +7622,9 @@ def run_selftest() -> None:
     assert pace_flags("online_dpo") == {"rewrite": False, "pareto": False, "hcpi": False}
     claims_ = {c["id"]: c for c in load_json(cfg.out / "claims.json")}
     assert "pace_no_degradation" in claims_ and "pace_vs_online_dpo:outcome" in claims_
+    assert "pace_dpo_init_vs_dpo:outcome" in rep["contrasts"], "offline-to-online contrast missing"
+    pdi = load_json(cfg.out / "pace_pace_dpo_init_42.json")
+    assert pdi["initial_dev_gain"] is not None, "pace_dpo_init did not measure its starting policy"
     assert rep["cluster_unit"].startswith("dialogue")
     sft_rows = [load_json(cfg.out / f"eval_sft_{sd}.json") for sd in cfg.seeds]
     assert [r["response"] for r in sft_rows[0]] != [r["response"] for r in sft_rows[1]], \
