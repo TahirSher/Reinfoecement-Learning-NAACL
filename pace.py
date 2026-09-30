@@ -1,5 +1,43 @@
 #!/usr/bin/env python3
-"""CARO v16 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
+"""PACE -- Pareto-Anchored Counterfactual Exploration: implicit-feedback alignment for customer satisfaction.
+
+Objective.  Align an LLM agent with customer satisfaction WITHOUT explicit human feedback (call-centre
+customers rarely leave any), producing replies that are safe and emotionally appropriate while conveying
+the SAME task information.  Satisfaction is inferred automatically: a customer simulator fine-tuned on
+EmoWOZ predicts the customer's next turn, and emotion / sentiment engines read its affect.
+
+Why a new algorithm.  The earlier pipeline (CARO: simulator -> learned reward model -> GRPO; kept below as
+a baseline) degraded performance.  The failure modes, and PACE's answer to each:
+  1. Nothing prevented RL from returning a WORSE policy.  -> High-confidence Pareto policy improvement:
+     every round is accepted only if a one-sided lower confidence bound on held-out dev contexts says it
+     beats SFT on affect without losing information, hygiene or the verdict of an INDEPENDENT monitor
+     labeller; otherwise the weights roll back and the trust region tightens (after Thomas et al., 2015).
+     The returned policy is, with probability >= 1 - alpha, no worse than SFT on those dev objectives.
+  2. A learned reward model with a weak human anchor was over-optimised.  -> No reward model: preferences
+     come straight from the judge, on a shared reply pool (common random numbers).
+  3. Reward noise was as large as the signal, so gradients followed noise.  -> Noise-calibrated
+     preferences: a pair counts only if its affect gap exceeds z noise sds, measured on the judge's own
+     replication null.
+  4. A scalar reward traded information for affect (shorter, emptier replies).  -> Pareto dominance: a
+     winner must also keep the task information of the gold turn, stay hygienic and stay in a length band.
+  5. Temperature sampling explores content, not delivery.  -> Content-anchored exploration: rewrites of
+     the reference reply that keep every fact and change only the delivery.
+The update is weighted DPO against the frozen SFT policy (whose optimum is the KL-regularised RL optimum;
+Rafailov et al., 2023) on on-policy samples plus rewrites, i.e. online, off-policy-corrected RL from
+automatic feedback.  Nothing is specific to the model (any causal LM + LoRA) or to the task: the judge,
+the constraint scorers and the rewrite instruction are plug-ins.
+
+Arms.  pace | ablations pace_no_rewrite, pace_no_pareto, pace_no_hcpi | baselines sft, sentiment_only (RL on
+agent-wording sentiment), online_dpo (standard online DPO, same judge), sft_bon_sim (best-of-N, same
+judge), and the CARO family (caro, dpo, sft_bon_rm, sft_lenmatch; need the corpus/reward stages).
+
+Evaluation is deliberately NOT only by the training judge: an out-of-family customer LLM with an unseen
+emotion classifier (eval-external), information retention against the gold turn, and a blinded human
+study (human-export / human-analyze).  claims.md states which claims the numbers support.
+
+History of the underlying pipeline (CARO v13-v16) follows.
+
+CARO v16 -- Counterfactual Affect Reward Optimisation on EmoWOZ, end to end.
 
 Stages: sft -> simulator -> validate -> corpus -> reward -> train -> eval -> report  (or `all`),
 then analysis (ablations, sensitivity, length analysis, external evaluator, claims, LaTeX), and
@@ -322,12 +360,15 @@ FILLER_BANKS = {"courtesy_v13": (NEUTRAL_TAILS, NEUTRAL_HEADS), "train": (TRAIN_
 FIT_BANK = "calib"
 _all_fill = [x for b in FILLER_BANKS.values() for part in b for x in part]
 assert len(_all_fill) == len(set(_all_fill)), "filler banks must be disjoint"
-VERSION = "v16"
-COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16")   # stage-3/4/5 artefacts from v9 onwards remain valid
+VERSION = "pace-1"
+COMPATIBLE_VERSIONS = ("v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "pace-1")   # stage-3/4/5 artefacts from v9 onwards remain valid
 
 # Arms that are optimised (need a train stage) versus arms that only re-use the SFT adapter.
-TRAINED_ARMS = ("sentiment_only", "dpo", "caro", "caro_no_abstain")
-EVAL_ONLY_ARMS = ("sft", "sft_bon_rm", "sft_lenmatch")
+TRAINED_ARMS = ("pace", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo",
+                "sentiment_only", "dpo", "caro", "caro_no_abstain")
+EVAL_ONLY_ARMS = ("sft", "sft_bon_sim", "sft_bon_rm", "sft_lenmatch")
+NEEDS_REWARD_MODEL = ("dpo", "caro", "caro_no_abstain", "sft_bon_rm", "sft_lenmatch")
+PRIMARY_ARMS = ("pace", "caro")          # the first one present is the method under test
 KNOWN_ARMS = TRAINED_ARMS + EVAL_ONLY_ARMS
 
 # Rude/irrelevant catch responses for the human-study attention checks.  They are never shown as a
@@ -352,6 +393,11 @@ _STOPWORDS = frozenset(
 
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 ROLE_LEAK_RE = re.compile(r"(?im)^\s*(customer|user|agent|system|assistant)\s*:")
+
+
+@contextmanager
+def _null_ctx():
+    yield
 
 
 def seed_everything(seed: int) -> None:
@@ -1666,26 +1712,33 @@ class Policy:
         logger.info("%s | best dev NLL=%.4f (ppl %.3f) at step %d", tag, best, math.exp(min(20.0, best)), best_step)
         return {"best_dev_nll": best, "best_step": best_step, "history": hist}
 
-    def generate(self, prompts: Sequence[str], gen: GenConfig, seed: Optional[int] = None) -> List[str]:
-        import torch
+    def generate(self, prompts: Sequence[str], gen: GenConfig, seed: Optional[int] = None,
+                 adapter: bool = True) -> List[str]:
+        """adapter=False samples from the base model (LoRA disabled): PACE's rewriter uses the base
+        instruct model, whose instruction following the SFT adapter has not specialised away."""
         self.model.eval()
         out: List[str] = []
-        for s in range(0, len(prompts), self.gen_batch):
-            chunk = list(prompts[s:s + self.gen_batch])
-            if seed is not None:
-                torch.manual_seed(seed + s)
-            enc = self.tok(chunk, return_tensors="pt", padding=True, truncation=True,
-                           max_length=self.max_len).to(self.device)
-            with torch.no_grad():
-                y = self.model.generate(
-                    **enc, max_new_tokens=gen.max_new_tokens, min_new_tokens=gen.min_new_tokens,
-                    do_sample=gen.do_sample, temperature=gen.temperature, top_p=gen.top_p,
-                    repetition_penalty=gen.repetition_penalty, pad_token_id=self.tok.pad_token_id,
-                    use_cache=True)
-            new = y[:, enc["input_ids"].shape[1]:]
-            for row in self.tok.batch_decode(new, skip_special_tokens=True):
-                out.append(trim_to_sentence(row))
+        ctx = self.model.disable_adapter() if (not adapter and hasattr(self.model, "disable_adapter")) else _null_ctx()
+        with ctx:
+            for s in range(0, len(prompts), self.gen_batch):
+                out.extend(self._generate_chunk(list(prompts[s:s + self.gen_batch]), gen,
+                                                None if seed is None else seed + s))
         return out
+
+    def _generate_chunk(self, chunk: List[str], gen: GenConfig, seed: Optional[int]) -> List[str]:
+        import torch
+        if seed is not None:
+            torch.manual_seed(seed)
+        enc = self.tok(chunk, return_tensors="pt", padding=True, truncation=True,
+                       max_length=self.max_len).to(self.device)
+        with torch.no_grad():
+            y = self.model.generate(
+                **enc, max_new_tokens=gen.max_new_tokens, min_new_tokens=gen.min_new_tokens,
+                do_sample=gen.do_sample, temperature=gen.temperature, top_p=gen.top_p,
+                repetition_penalty=gen.repetition_penalty, pad_token_id=self.tok.pad_token_id,
+                use_cache=True)
+        new = y[:, enc["input_ids"].shape[1]:]
+        return [trim_to_sentence(row) for row in self.tok.batch_decode(new, skip_special_tokens=True)]
 
     def features(self, prompts: Sequence[str], responses: Sequence[str], dim: int = 256,
                  seed: int = 12345) -> np.ndarray:
@@ -1717,6 +1770,49 @@ class Policy:
     def snapshot_trainable(self) -> Dict[str, Any]:
         """Detached clone of every trainable (LoRA) tensor -- the frozen RL reference policy."""
         return {n: p.detach().clone() for n, p in self.model.named_parameters() if p.requires_grad}
+
+    def restore_trainable(self, snap: Dict[str, Any]) -> None:
+        """Roll the trainable tensors back to a snapshot (PACE's rejected-round rollback)."""
+        import torch
+        with torch.no_grad():
+            for n, prm in self.model.named_parameters():
+                if n in snap:
+                    prm.data.copy_(snap[n])
+
+    def pace_update(self, pairs: Sequence[Tuple[str, str, str]], weights: Sequence[float],
+                    ref_snapshot: Dict[str, Any], beta: float, lr: float, epochs: int, batch: int,
+                    nll_coef: float, seed: int) -> Dict[str, float]:
+        """Weighted DPO steps on (prompt, chosen, rejected) with the SFT snapshot as reference, plus a
+        length-normalised NLL term on the chosen reply (keeps the chosen likelihood from collapsing,
+        the known failure of pure DPO; Pang et al., 2024)."""
+        import torch
+        import torch.nn.functional as F
+        from torch.optim import AdamW
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        opt = AdamW(params, lr=lr, weight_decay=0.0)
+        rng = random.Random(seed)
+        idx = list(range(len(pairs)))
+        tot, n_b, acc = 0.0, 0, 0.0
+        for _ in range(max(1, epochs)):
+            rng.shuffle(idx)
+            for s0 in range(0, len(idx), batch):
+                b = idx[s0:s0 + batch]
+                bp = [pairs[i] for i in b]
+                w = torch.tensor([float(weights[i]) for i in b], device=self.device)
+                self.model.eval()             # no LoRA dropout: policy and reference see the same network
+                m = self._dpo_margins(bp, ref_snapshot)
+                loss = (w * -F.logsigmoid(beta * m)).sum() / w.sum().clamp_min(1e-6)
+                if nll_coef > 0:
+                    loss = loss - nll_coef * self._seq_logprob([(p_, c_) for p_, c_, _ in bp], reduce="mean").mean()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                opt.step()
+                tot += float(loss.detach())
+                acc += float((m.detach() > 0).float().mean())
+                n_b += 1
+        opt.zero_grad(set_to_none=True)
+        return {"loss": tot / max(1, n_b), "train_pref_acc": acc / max(1, n_b), "steps": n_b}
 
     @contextmanager
     def frozen_weights(self, snap: Optional[Dict[str, Any]]):
@@ -2160,16 +2256,34 @@ class StubPolicy:
                 "n_dev": len(dev)}
 
     def snapshot_trainable(self) -> Dict[str, Any]:
-        return {}
+        return {"tag": self._adapter.get("tag", "")}
+
+    def restore_trainable(self, snap: Dict[str, Any]) -> None:
+        self._adapter = {**self._adapter, "tag": snap.get("tag", "")}
+
+    def pace_update(self, pairs, weights, ref_snapshot, beta, lr, epochs, batch, nll_coef, seed) -> Dict[str, float]:
+        # stub: no autograd; a new tag makes the updated policy generate different text
+        self._adapter = {**self._adapter, "tag": f"{self._adapter.get('tag', '')}+u{seed}"}
+        return {"loss": float("nan"), "train_pref_acc": float("nan"), "steps": 0}
 
     @contextmanager
     def frozen_weights(self, snap: Optional[Dict[str, Any]]):
-        yield
+        if not snap:
+            yield
+            return
+        keep = self._adapter
+        self._adapter = {**keep, "tag": snap.get("tag", "")}
+        try:
+            yield
+        finally:
+            self._adapter = keep
 
-    def generate(self, prompts: Sequence[str], gen: GenConfig, seed: Optional[int] = None) -> List[str]:
+    def generate(self, prompts: Sequence[str], gen: GenConfig, seed: Optional[int] = None,
+                 adapter: bool = True) -> List[str]:
         out = []
+        tag = self._adapter.get("tag", "") if adapter else "base"
         for i, p in enumerate(prompts):
-            h = int(hashlib.sha256(f"{p}|{seed}|{i}|{self._adapter.get('tag', '')}".encode()).hexdigest()[:12], 16)
+            h = int(hashlib.sha256(f"{p}|{seed}|{i}|{tag}".encode()).hexdigest()[:12], 16)
             rng = np.random.default_rng(h % (2 ** 32))
             n = int(rng.integers(6, 34))
             words = list(rng.choice(np.asarray(self.vocab, dtype=object), size=n, replace=True))
@@ -2576,6 +2690,15 @@ class UserSimulator:
         2000).  The estimand is the one the sampled estimator targets, but the Monte Carlo error is
         common to all responses of a context, so it largely cancels in within-context comparisons,
         which is what the corpus labels are.  Given the pool the estimate is deterministic."""
+        return self.pool_expectations(turns, responses)["sent"]
+
+    def pool_expectations(self, turns: Sequence[Turn], responses: Sequence[str],
+                          labellers: Optional[Dict[str, Callable[[Sequence[str]], np.ndarray]]] = None
+                          ) -> Dict[str, np.ndarray]:
+        """SNIS expectations over the shared pool under the training sentiment AND any extra labeller.
+        Extra labellers score each pool reply once (cached in memory), so an independent monitor
+        labeller costs one classifier pass per pool and no generation."""
+        labellers = labellers or {}
         turns, responses = list(turns), [norm_text(r) for r in responses]
         self.prepare(turns, responses)
         pre, rep, row = [], [], []
@@ -2588,13 +2711,25 @@ class UserSimulator:
             row.extend([i] * len(pool["replies"]))
         lp = self._pairs(pre, rep)
         row = np.asarray(row, int)
-        out = np.zeros(len(turns), float)
+        for name, fn in labellers.items():
+            miss = [pl for pl in {id(pl): pl for pl in pools}.values() if f"lab_{name}" not in pl]
+            if miss:
+                flat = [c for pl in miss for c in pl["replies"]]
+                vals = np.asarray(fn(flat), float)
+                o = 0
+                for pl in miss:
+                    pl[f"lab_{name}"] = vals[o:o + len(pl["replies"])].tolist()
+                    o += len(pl["replies"])
+        out = {k: np.zeros(len(turns), float) for k in ["sent"] + list(labellers)}
         ess = np.zeros(len(turns), float)
         for i, pool in enumerate(pools):
             w, e = snis_weights(lp[row == i], np.asarray(pool["log_q"], float))
-            out[i] = float(w @ np.asarray(pool["sent"], float))
+            out["sent"][i] = float(w @ np.asarray(pool["sent"], float))
+            for name in labellers:
+                out[name][i] = float(w @ np.asarray(pool[f"lab_{name}"], float))
             ess[i] = e
         self.last_ess = ess
+        out["ess"] = ess
         return out
 
     def fit(self, train: Sequence[Turn], dev: Sequence[Turn], cfg: SFTConfig, best_dir: Path,
@@ -4222,6 +4357,321 @@ def train_grpo(policy, reward_fn, turns: Sequence[Turn], cfg: GRPOConfig, gen: G
             "baseline_length": base_len, "baseline_hygiene": base_hyg}
 
 
+# =============================================================================================
+# PACE: Pareto-Anchored Counterfactual Exploration
+# =============================================================================================
+REWRITE_INSTRUCTION = ("You are a customer service agent. Improve the draft reply so that the customer feels heard "
+                       "and respected. Keep every fact, number, name and request from the draft, do not add new "
+                       "facts, and keep it about the same length. Write only the improved reply.")
+PACE_ARMS = ("pace", "pace_no_rewrite", "pace_no_pareto", "pace_no_hcpi", "online_dpo")
+
+
+@dataclass
+class PACEConfig:
+    rounds: int = 4                     # collect -> mine -> update -> accept/reject cycles
+    contexts_per_round: int = 512
+    group: int = 4                      # on-policy samples per context
+    rewrites: int = 2                   # content-anchored rewrites of the reference reply per context
+    pool_size: int = 16                 # simulator replies per context (shared by all candidates)
+    beta: float = 0.1                   # DPO temperature (KL strength); doubled after a rejected round
+    lr: float = 5e-6                    # halved after a rejected round
+    epochs: int = 2
+    batch: int = 4
+    nll_coef: float = 0.05
+    z: float = 1.645                    # one-sided 95% noise margin for a preference
+    eps_content: float = 0.05           # a winner may not lose more than this much gold-information recall
+    len_low: float = 0.5                # length band relative to the reference reply (anti-truncation /
+    len_high: float = 1.6               # anti-padding): words(y) / words(y_ref) must lie in [low, high]
+    max_pairs: int = 3
+    dev_contexts: int = 300
+    alpha: float = 0.05                 # family-wise level of the acceptance tests (Bonferroni over rounds)
+    tol_frac: float = 0.1               # non-inferiority tolerance = tol_frac x the SFT dev sd of that metric
+    max_rejections: int = 2
+    calib_contexts: int = 48
+    rewriter: str = "base"              # base (LoRA disabled) | policy
+    monitor_model: str = "SamLowe/roberta-base-go_emotions"
+
+
+def pace_flags(arm: str) -> Dict[str, bool]:
+    """Component switches per arm.  online_dpo is the standard online/iterative DPO baseline with the same
+    judge (best-vs-worst by the affect estimate, no noise margin, no constraints, no acceptance test)."""
+    return {"rewrite": arm not in ("pace_no_rewrite", "online_dpo"),
+            "pareto": arm not in ("pace_no_pareto", "online_dpo"),
+            "hcpi": arm not in ("pace_no_hcpi", "online_dpo")}
+
+
+def content_score(response: str, t: Turn) -> float:
+    """Task information conveyed, relative to the real agent turn: mean of salient-token recall and slot
+    recall against the gold turn.  NaN when the gold turn carries no task information."""
+    a = info_recall(response, t.gold_response)
+    b = slot_prf(response, t.gold_response)[1]
+    v = [x for x in (a, b) if math.isfinite(x)]
+    return float(np.mean(v)) if v else float("nan")
+
+
+def mine_pareto_pairs(A: np.ndarray, C: np.ndarray, H: np.ndarray, ref_idx: int, sigma: float, z: float,
+                      eps_c: float, pareto: bool = True, max_pairs: int = 3) -> List[Tuple[int, int, float, str]]:
+    """Preference pairs (winner, loser, weight, kind) for ONE context.
+
+    pareto=True (PACE).  i beats j only if (a) i is feasible (hygienic and inside the length band),
+    (b) the affect gain A_i - A_j is at least z noise sds of a within-context difference -- sigma is
+    measured on the estimator's own replication null, so a preference is a statistically resolved one,
+    not a coin flip of Monte Carlo noise -- and (c) i conveys no less task information than j (up to
+    eps_c).  Selected: the largest-margin dominance pair, the largest-margin pair that beats the
+    REFERENCE reply (an explicit improvement over what SFT would say), and one constraint pair
+    (feasible beats infeasible).  Weights grow with the margin in noise units, from 0.5 to 1.
+    pareto=False (online DPO): best vs worst by affect, weight 1."""
+    A, C, H = np.asarray(A, float), np.asarray(C, float), np.asarray(H, bool)
+    n = A.size
+    if n < 2:
+        return []
+    if not pareto:
+        i, j = int(np.argmax(A)), int(np.argmin(A))
+        return [(i, j, 1.0, "affect")] if A[i] - A[j] > 0 else []
+    sig = max(float(sigma), 1e-6)
+
+    def c_ok(i, j):
+        return (not (math.isfinite(C[i]) and math.isfinite(C[j]))) or C[i] >= C[j] - eps_c
+
+    dom = [(float(A[i] - A[j]), i, j) for i in range(n) if H[i] for j in range(n)
+           if j != i and A[i] - A[j] >= z * sig and c_ok(i, j)]
+    out: List[Tuple[int, int, float, str]] = []
+
+    def w(d):
+        return float(min(1.0, max(0.5, d / (2.0 * z * sig))))
+    if dom:
+        d, i, j = max(dom)
+        out.append((i, j, w(d), "dominance"))
+        anc = [x for x in dom if x[2] == ref_idx and (x[1], x[2]) != (i, j)]
+        if anc:
+            d2, i2, j2 = max(anc)
+            out.append((i2, j2, w(d2), "beats_reference"))
+    feas, infeas = np.flatnonzero(H), np.flatnonzero(~H)
+    if feas.size and infeas.size:
+        i = int(feas[np.argmax(A[feas])])
+        out.append((i, int(infeas[0]), 0.5, "constraint"))
+    return out[:max_pairs]
+
+
+def one_sided_lower(d: np.ndarray, cluster: np.ndarray, alpha: float, seed: int, n_boot: int = 2000) -> float:
+    """Lower (1 - alpha) confidence bound of the mean of a paired difference, dialogue-clustered bootstrap."""
+    d = np.asarray(d, float)
+    ok = np.isfinite(d)
+    if ok.sum() < 20:
+        return float("nan")
+    dd, cc = d[ok], np.asarray(cluster, dtype=object)[ok]
+    _, lo, _ = cluster_bootstrap_ci(lambda ix: float(np.mean(dd[ix])), cc, n_boot, seed, conf=1.0 - 2.0 * alpha)
+    return float(lo)
+
+
+def hcpi_decision(dA: np.ndarray, dM: Optional[np.ndarray], dC: np.ndarray, dH: np.ndarray, cluster: np.ndarray,
+                  alpha: float, tol_M: float, tol_C: float, tol_H: float, best_gain: float, seed: int
+                  ) -> Dict[str, Any]:
+    """High-confidence Pareto policy improvement (after Thomas et al., 2015, extended to a vector of
+    objectives).  Accept the candidate policy only if, on held-out dev contexts and paired with the SFT
+    policy on the same reply pools:
+      * the one-sided (1 - alpha) lower bound of the affect gain is > 0, and its mean beats the best
+        accepted round so far;
+      * the independent MONITOR labeller does not fall by more than tol_M (lower bound), which catches
+        reward hacking of the training labeller;
+      * task information does not fall by more than tol_C (lower bound) -- "the same information";
+      * hygiene does not fall by more than tol_H (mean).
+    With the level split over rounds (Bonferroni) the returned policy is, with probability >= 1 - alpha,
+    no worse than SFT on the dev objectives: RL cannot silently degrade the model."""
+    lbA = one_sided_lower(dA, cluster, alpha, seed)
+    lbM = one_sided_lower(dM, cluster, alpha, seed + 1) if dM is not None else float("nan")
+    lbC = one_sided_lower(dC, cluster, alpha, seed + 2)
+    mA = float(np.nanmean(dA))
+    mH = float(np.nanmean(dH))
+    checks = {"affect_lb_positive": bool(math.isfinite(lbA) and lbA > 0),
+              "beats_best_round": bool(mA > best_gain),
+              "monitor_noninferior": bool(dM is None or not math.isfinite(lbM) or lbM > -tol_M),
+              "information_noninferior": bool(not math.isfinite(lbC) or lbC > -tol_C),
+              "hygiene_noninferior": bool(mH >= -tol_H)}
+    return {"accept": all(checks.values()), "checks": checks, "mean_affect_gain": mA, "lb_affect": lbA,
+            "mean_monitor_gain": float(np.nanmean(dM)) if dM is not None else float("nan"), "lb_monitor": lbM,
+            "mean_info_gain": float(np.nanmean(dC)) if np.isfinite(dC).any() else float("nan"), "lb_info": lbC,
+            "mean_hygiene_gain": mH, "tolerances": {"monitor": tol_M, "info": tol_C, "hygiene": tol_H}}
+
+
+def _pace_judge(sim: "UserSimulator", turns: Sequence[Turn], texts: Sequence[str], monitor) -> Dict[str, np.ndarray]:
+    """Affect under the training labeller and (if the estimator is the shared pool) under the monitor."""
+    if sim.mode == "pool":
+        ex_ = sim.pool_expectations(turns, texts, {"monitor": monitor} if monitor is not None else None)
+        return {"A": ex_["sent"], "M": ex_.get("monitor")}
+    return {"A": sim.raw(turns, texts), "M": None}
+
+
+def train_pace(ex: "Experiment", cfg: "Config", arm: str, seed: int) -> Dict[str, Any]:
+    """PACE -- Pareto-Anchored Counterfactual Exploration.  One round:
+
+      1. COLLECT.  For each training context: a reference reply y_ref from the frozen SFT policy (the
+         content anchor), `group` on-policy samples, and `rewrites` content-anchored rewrites of y_ref
+         ("keep every fact, change the delivery").  Temperature sampling mostly varies content;
+         rewriting explores the axis the objective is about -- delivery at fixed content.
+      2. JUDGE.  Every candidate of a context is scored on ONE shared reply pool (common random numbers)
+         for customer affect, plus task information against the gold turn and hygiene / length band.
+      3. MINE.  Noise-calibrated Pareto-dominance pairs (mine_pareto_pairs).  No learned reward model:
+         preferences come straight from the judge, so there is no reward model to over-optimise.
+      4. UPDATE.  Weighted DPO with the SFT policy as the fixed reference (the DPO optimum is the
+         KL-regularised RL optimum; Rafailov et al., 2023) plus an NLL term on winners.
+      5. ACCEPT OR ROLL BACK.  High-confidence Pareto policy improvement on held-out dev contexts
+         (hcpi_decision).  A rejected round restores the last accepted weights and doubles beta /
+         halves the learning rate (a tighter trust region); two consecutive rejections stop training.
+    The returned policy is the last ACCEPTED one; if no round is accepted it is the SFT policy, and
+    the run says so."""
+    pc = cfg.pace
+    flags = pace_flags(arm)
+    lg = ex.logger
+    tag = f"{arm}_s{seed}"
+    seed_everything(seed)
+    pol = ex.policy_with("sft_policy")
+    sim = ex.simulator(ex.policy_with("simulator"))
+    sim.pool_size = pc.pool_size
+    monitor = None
+    if flags["hcpi"] or arm == "pace":
+        monitor = StubEmotion() if cfg.stub else EmotionValenceScorer(pc.monitor_model, cfg.device, cfg.models_dir, lg)
+    if sim.mode != "pool":
+        lg.warning("%s | the certified estimator is '%s', not the shared pool: preferences lose their common "
+                   "random numbers and the monitor labeller is unavailable", tag, sim.mode)
+    ref = pol.snapshot_trainable()
+    accepted = pol.snapshot_trainable()
+    rng = random.Random(seed)
+    pool_tr = filter_turns(ex.turns, "train", seed=seed, limit=pc.rounds * pc.contexts_per_round + 1000)
+    rng.shuffle(pool_tr)
+    dev = filter_turns(ex.turns, "valid", require_next=True, limit=pc.dev_contexts, seed=seed + 991,
+                       logger=lg, what="PACE dev contexts (acceptance tests)")
+    samp = GenConfig(max_new_tokens=64, min_new_tokens=4, temperature=1.0, top_p=0.95)
+    evalg = GenConfig(max_new_tokens=64, min_new_tokens=4, temperature=0.7, top_p=0.95)
+    rwg = GenConfig(max_new_tokens=96, min_new_tokens=4, temperature=0.8, top_p=0.95)
+
+    # ---- dev baseline: SFT replies, pools built from gold + SFT; every later round is scored on them
+    sim.pool_ns = f"pace_dev_s{seed}"
+    with pol.frozen_weights(ref):
+        dev_sft = pol.generate([agent_prompt(t) for t in dev], evalg, seed=seed * 7 + 1)
+    sim.prepare(dev, dev_sft)
+    j0 = _pace_judge(sim, dev, dev_sft, monitor)
+    C0 = np.asarray([content_score(r, t) for r, t in zip(dev_sft, dev)], float)
+    H0 = np.asarray([float(hygiene_ok(r)[0]) for r in dev_sft], float)
+    dcl = np.asarray([t.dialogue_id for t in dev], dtype=object)
+    tol_M = pc.tol_frac * float(np.std(j0["M"])) if j0["M"] is not None else 0.0
+    tol_C = pc.tol_frac * float(np.nanstd(C0)) if np.isfinite(C0).any() else 0.0
+    lg.info("%s | PACE flags %s | dev baseline (SFT) on %d contexts: affect %.4f | monitor %s | info %.3f | "
+            "hygiene %.3f", tag, flags, len(dev), float(np.mean(j0["A"])),
+            "n/a" if j0["M"] is None else f"{float(np.mean(j0['M'])):.4f}", float(np.nanmean(C0)), float(H0.mean()))
+
+    beta, lr = pc.beta, pc.lr
+    best_gain, rejections, n_acc = 0.0, 0, 0
+    sigma = float("nan")
+    hist: List[Dict[str, Any]] = []
+    alpha_r = pc.alpha / max(1, pc.rounds)
+    for rd in range(1, pc.rounds + 1):
+        ctx = pool_tr[(rd - 1) * pc.contexts_per_round: rd * pc.contexts_per_round]
+        if len(ctx) < 8:
+            break
+        # 1. collect
+        with pol.frozen_weights(ref):
+            y_ref = pol.generate([agent_prompt(t) for t in ctx], evalg, seed=seed * 1000 + rd)
+        samples = pol.generate([agent_prompt(t) for t in ctx for _ in range(pc.group)], samp, seed=seed * 1000 + 100 + rd)
+        rws: List[str] = []
+        if flags["rewrite"] and pc.rewrites > 0:
+            rprompts = [f"{REWRITE_INSTRUCTION}\n{t.history}\nCustomer: {t.user_text}\nDraft reply: {norm_text(y)}\n"
+                        f"Improved reply:" for t, y in zip(ctx, y_ref) for _ in range(pc.rewrites)]
+            rws = pol.generate(rprompts, rwg, seed=seed * 1000 + 200 + rd, adapter=(pc.rewriter != "base"))
+        cands: List[List[str]] = []
+        for k, t in enumerate(ctx):
+            c = [norm_text(y_ref[k])]
+            c += [norm_text(x) for x in rws[k * pc.rewrites:(k + 1) * pc.rewrites]] if rws else []
+            c += [norm_text(x) for x in samples[k * pc.group:(k + 1) * pc.group]]
+            cands.append(c)            # index 0 is always the reference reply (the Pareto anchor)
+        flat_t = [t for t, c in zip(ctx, cands) for _ in c]
+        flat_y = [y for c in cands for y in c]
+        # 2. judge on one shared pool per context
+        sim.pool_ns = f"pace_s{seed}_r{rd}"
+        sim.prepare(flat_t, flat_y)
+        A = _pace_judge(sim, flat_t, flat_y, None)["A"]
+        if not math.isfinite(sigma):
+            # noise sd of a within-context difference, from an independent replicate pool
+            nc = [k for k in range(min(pc.calib_contexts, len(ctx)))]
+            off = np.cumsum([0] + [len(c) for c in cands])
+            ix = np.concatenate([np.arange(off[k], off[k + 1]) for k in nc])
+            if sim.mode == "pool":
+                with sim.replicate_pool(1):
+                    A1 = _pace_judge(sim, [flat_t[i] for i in ix], [flat_y[i] for i in ix], None)["A"]
+            else:
+                A1 = sim.raw([flat_t[i] for i in ix], [flat_y[i] for i in ix], crn_seed=seed + 17)
+            A0 = A[ix]
+            dd, pos = [], 0
+            for k in nc:
+                m = off[k + 1] - off[k]
+                a0, a1 = A0[pos:pos + m], A1[pos:pos + m]
+                iu = np.triu_indices(m, 1)
+                dd.extend(((a0[:, None] - a0[None, :]) - (a1[:, None] - a1[None, :]))[iu].tolist())
+                pos += m
+            sigma = float(max(np.std(dd) / math.sqrt(2.0), 1e-4)) if dd else 1e-3
+            lg.info("%s | noise sd of a within-context affect difference (replicate pool): %.5f | preference "
+                    "margin z*sigma = %.5f", tag, sigma, pc.z * sigma)
+        # 3. mine
+        pairs, weights, kinds = [], [], []
+        off = 0
+        for k, t in enumerate(ctx):
+            m = len(cands[k])
+            a = A[off:off + m]
+            cs = np.asarray([content_score(y, t) for y in cands[k]], float)
+            rw = max(1, len(cands[k][0].split()))
+            hs = np.asarray([hygiene_ok(y)[0] and (i == 0 or pc.len_low <= len(y.split()) / rw <= pc.len_high)
+                             for i, y in enumerate(cands[k])], bool)
+            for i, j, w, kind in mine_pareto_pairs(a, cs, hs, 0, sigma, pc.z, pc.eps_content, flags["pareto"],
+                                                   pc.max_pairs):
+                pairs.append((agent_prompt(t), cands[k][i], cands[k][j]))
+                weights.append(w)
+                kinds.append(kind)
+            off += m
+        kc = {k_: kinds.count(k_) for k_ in set(kinds)}
+        # 4. update
+        upd = pol.pace_update(pairs, weights, ref, beta, lr, pc.epochs, pc.batch, pc.nll_coef, seed * 100 + rd) \
+            if pairs else {"loss": float("nan"), "train_pref_acc": float("nan"), "steps": 0}
+        # 5. accept or roll back
+        dev_new = pol.generate([agent_prompt(t) for t in dev], evalg, seed=seed * 7 + 1)
+        sim.pool_ns = f"pace_dev_s{seed}"
+        j1 = _pace_judge(sim, dev, dev_new, monitor)
+        C1 = np.asarray([content_score(r, t) for r, t in zip(dev_new, dev)], float)
+        H1 = np.asarray([float(hygiene_ok(r)[0]) for r in dev_new], float)
+        dec = hcpi_decision(j1["A"] - j0["A"], (j1["M"] - j0["M"]) if j0["M"] is not None else None, C1 - C0,
+                            H1 - H0, dcl, alpha_r, tol_M, tol_C, 0.02, best_gain, seed + rd)
+        accept = dec["accept"] if flags["hcpi"] else True
+        if accept:
+            accepted = pol.snapshot_trainable()
+            best_gain = max(best_gain, dec["mean_affect_gain"])
+            rejections = 0
+            n_acc += 1
+        else:
+            pol.restore_trainable(accepted)
+            beta, lr = beta * 2.0, lr * 0.5
+            rejections += 1
+        rec = {"round": rd, "contexts": len(ctx), "candidates": len(flat_y), "pairs": len(pairs), "pair_kinds": kc,
+               "sigma": sigma, "beta": beta, "lr": lr, **upd, **dec, "accepted": bool(accept),
+               "dev_words": float(np.mean([len(r.split()) for r in dev_new]))}
+        hist.append(rec)
+        lg.info("%s | round %d | %d candidates -> %d pairs %s | loss %.4f pref-acc %.3f | dev: affect %+.4f (LB %+.4f) "
+                "monitor %+.4f info %+.3f hygiene %+.3f | %s%s", tag, rd, len(flat_y), len(pairs), kc, upd["loss"],
+                upd["train_pref_acc"], dec["mean_affect_gain"], dec["lb_affect"], dec["mean_monitor_gain"],
+                dec["mean_info_gain"], dec["mean_hygiene_gain"], "ACCEPT" if accept else "REJECT -> rollback",
+                "" if accept else f" (failed: {[k for k, v in dec['checks'].items() if not v]}; beta {beta:g}, lr {lr:.1e})")
+        if rejections >= pc.max_rejections:
+            lg.info("%s | %d consecutive rejections: stopping", tag, rejections)
+            break
+    pol.restore_trainable(accepted)
+    if flags["hcpi"] and n_acc == 0:
+        lg.warning("%s | no round passed the high-confidence acceptance test: the returned policy IS the SFT "
+                   "policy. That is the algorithm working as designed, not a crash: report it.", tag)
+    if cfg.stub and hasattr(pol, "_adapter"):
+        pol._adapter = {**pol._adapter, "tag": pol._adapter.get("tag", "") + f"|{tag}"}
+    pol.save_adapter(cfg.out / f"policy_{tag}")
+    return {"arm": arm, "seed": seed, "flags": flags, "rounds": hist, "accepted_rounds": n_acc,
+            "returned_sft": bool(flags["hcpi"] and n_acc == 0), "sigma": sigma, "config": asdict(pc)}
+
+
 def eval_gen_seed(seed: int, offset: int, draw: int = 0) -> int:
     """Generation seed of one evaluation batch.  Shared by every arm, so arms are compared under
     common random numbers; `draw` indexes extra samples for the best-of-N / length-matched arms."""
@@ -4328,8 +4778,9 @@ class Config:
     corpus_temperature: float = 1.0
     eval_turns: int = 800
     strict: bool = True
-    arms: Tuple[str, ...] = ("sft", "sentiment_only", "dpo", "caro", "sft_bon_rm", "sft_lenmatch")
+    arms: Tuple[str, ...] = ("sft", "sentiment_only", "online_dpo", "pace", "sft_bon_sim")
     dpo: DPOConfig = field(default_factory=DPOConfig)
+    pace: PACEConfig = field(default_factory=PACEConfig)
     bon_n: int = 4                           # samples per context for sft_bon_rm and sft_lenmatch
     reward_dev_anchor_tol: float = 0.05     # R4: DEV anchor may not fall more than this below the plain ranker's
     reward_min_gold_anchor: float = 0.10
@@ -4345,7 +4796,7 @@ class Config:
     human_contexts: int = 150               # R3: contexts per arm comparison in the human packet
     human_validity_pairs: int = 200         # R3: within-context simulator-validity items
     human_overlap: float = 0.3              # R3: share of items annotated twice (for agreement)
-    human_comparisons: Tuple[str, ...] = ("caro:sft", "caro:sentiment_only", "caro:dpo")
+    human_comparisons: Tuple[str, ...] = ("pace:sft", "pace:online_dpo", "pace:sentiment_only")
     pool_size: int = 32                     # v16: simulated customer replies per context (shared-pool estimator)
     pool_proposals: int = 4                 # v16: proposal agent turns per pool (gold + up to 3 candidates)
     stability_safety: float = 0.8           # v15: FIT-half flip limit = this x max_abs_flip when choosing T (0 = off)
@@ -4374,7 +4825,7 @@ class Experiment:
         cfg.out.mkdir(parents=True, exist_ok=True)
         self.logger = make_logger(cfg.out, tag)
         seed_everything(cfg.seed)
-        self.logger.info("CARO %s | tag=%s | device=%s | out=%s | stub=%s | seeds=%s", VERSION,
+        self.logger.info("PACE %s | tag=%s | device=%s | out=%s | stub=%s | seeds=%s", VERSION,
                          tag, cfg.device, cfg.out, cfg.stub, cfg.seeds)
         if cfg.download and not cfg.stub:
             download_emowoz(cfg.data_dir, self.logger)
@@ -4974,6 +5425,10 @@ def stage_train(cfg: Config, arm: str, seed: int) -> Dict[str, Any]:
         return {"arm": arm, "seed": seed, "skipped": True}
     if arm not in TRAINED_ARMS:
         raise ValueError(f"unknown arm {arm}; choose from {KNOWN_ARMS}")
+    if arm in PACE_ARMS:
+        res = train_pace(ex, cfg, arm, seed)
+        dump_json(res, cfg.out / f"pace_{arm}_{seed}.json")
+        return res
     seed_everything(seed)
     pol = ex.policy_with("sft_policy")
     if arm == "dpo":
@@ -5032,10 +5487,32 @@ def stage_eval(cfg: Config, arm: str, seed: int) -> Dict[str, Any]:
     te = filter_turns(ex.turns, "test", require_next=True, limit=cfg.eval_turns, seed=cfg.seed,
                       logger=ex.logger, what="evaluation turns")
     gen = ex.gen(0.7)
-    if arm in ("sft_bon_rm", "sft_lenmatch"):
+    if arm in ("sft_bon_rm", "sft_lenmatch", "sft_bon_sim"):
         samples = _sample_n(pol, te, gen, seed, cfg.bon_n)
         chosen, extra = [], []
-        if arm == "sft_bon_rm":
+        if arm == "sft_bon_sim":
+            # Best-of-N by the SAME judge PACE trains on, selected on an independent reply pool ("bon_select")
+            # so that the evaluation pool does not reward its own selection noise (winner's curse).
+            if sim.mode != "pool":
+                ex.logger.warning("sft_bon_sim with the '%s' estimator selects and evaluates with the same "
+                                  "numbers: its score is optimistically biased", sim.mode)
+            keep_ns = sim.pool_ns
+            sim.pool_ns = "bon_select"
+            ft = [t for t, c in zip(te, samples) for _ in c]
+            fy = [y for c in samples for y in c]
+            a = np.asarray(sim.raw(ft, fy), float)
+            sim.pool_ns = keep_ns
+            off = 0
+            for t, cand in zip(te, samples):
+                r = a[off:off + len(cand)].copy()
+                ok = np.asarray([hygiene_ok(c)[0] for c in cand], bool)
+                if ok.any():
+                    r[~ok] = -np.inf
+                k = int(np.argmax(r))
+                chosen.append(cand[k])
+                extra.append({"bon_pick": k})
+                off += len(cand)
+        elif arm == "sft_bon_rm":
             rm = RewardModel.load(load_json(cfg.out / "reward_model.json"))
             for t, cand in zip(te, samples):
                 f = pol.features([agent_prompt(t)] * len(cand), cand, dim=cfg.feat_dim)
@@ -5078,12 +5555,13 @@ def load_eval_rows(cfg: "Config", arms: Optional[Sequence[str]] = None, prefix: 
 
 
 def comparison_plan(arms: Sequence[str]) -> List[Tuple[str, str]]:
-    """Every arm against SFT, and CARO against every other arm (the controls that decide whether
+    """Every arm against SFT, and the primary method (PACE, else CARO) against every other arm (the controls that decide whether
     the simulator-derived reward adds anything: sentiment-only reward, offline DPO on the same
     corpus, best-of-N reranking, the length-matched SFT control, RL without abstention)."""
     plan = [(a, "sft") for a in arms if a != "sft"]
-    if "caro" in arms:
-        plan += [("caro", a) for a in arms if a not in ("sft", "caro")]
+    primary = next((a for a in PRIMARY_ARMS if a in arms), None)
+    if primary is not None:
+        plan += [(primary, a) for a in arms if a not in ("sft", primary)]
     return plan
 
 
@@ -6296,22 +6774,31 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
             return None
         return bool(c["ci95"][0] > 0 and c.get("p_holm", 1.0) < 0.05)
 
-    for comp, text in (("caro_vs_sft:outcome", "CARO raises the simulated customer-affect outcome over SFT"),
-                       ("caro_vs_sentiment_only:outcome", "the simulator-derived reward beats rewarding positive agent "
+    P = next((a for a in PRIMARY_ARMS if a in rep.get("arms", {})), "caro")
+    NAME = P.upper()
+    for comp, text in ((f"{P}_vs_sft:outcome", f"{NAME} raises the simulated customer-affect outcome over SFT"),
+                       (f"{P}_vs_sentiment_only:outcome", "the simulator-derived signal beats rewarding positive agent "
                                                           "wording (sentiment-only RL)"),
-                       ("caro_vs_dpo:outcome", "online RL on the learnt reward beats offline DPO on the same corpus"),
-                       ("caro_vs_sft_bon_rm:outcome", "RL adds beyond best-of-N reranking with the same reward"),
-                       ("caro_vs_sft_lenmatch:outcome", "the gain is not explained by response length "
+                       (f"{P}_vs_online_dpo:outcome", "PACE beats standard online DPO with the same judge"),
+                       (f"{P}_vs_sft_bon_sim:outcome", "the trained policy beats best-of-N sampling with the same judge"),
+                       (f"{P}_vs_pace_no_rewrite:outcome", "content-anchored rewrite exploration contributes"),
+                       (f"{P}_vs_pace_no_pareto:outcome", "noise-calibrated Pareto pairs contribute"),
+                       (f"{P}_vs_pace_no_hcpi:outcome", "the acceptance test does not cost affect"),
+                       (f"{P}_vs_dpo:outcome", "online RL beats offline DPO on the reward corpus"),
+                       (f"{P}_vs_sft_bon_rm:outcome", "RL adds beyond best-of-N reranking with the learnt reward"),
+                       (f"{P}_vs_sft_lenmatch:outcome", "the gain is not explained by response length "
                                                         "(design-based length-matched SFT control)")):
+        if comp not in C:
+            continue
         c = C.get(comp)
         v = sig_pos(c)
         add(comp, text, "untested" if v is None else ("supported" if v else "not supported"),
             None if not c else {k: c.get(k) for k in ("delta", "ci95", "p_text", "p_holm", "n_clusters")})
-    c = C.get("caro_vs_sft:info_recall")
-    add("information", "CARO conveys no less task information than SFT (non-inferiority, recall of gold salient "
+    c = C.get(f"{P}_vs_sft:info_recall")
+    add("information", f"{NAME} conveys no less task information than SFT (non-inferiority, recall of gold salient "
         "tokens)", "untested" if not c else ("supported" if c.get("noninferior") else "not supported"),
         None if not c else {k: c.get(k) for k in ("delta", "ci90", "noninferiority_margin", "noninferior")})
-    e = ext.get("contrasts", {}).get("caro_vs_sft:outcome")
+    e = ext.get("contrasts", {}).get(f"{P}_vs_sft:outcome")
     add("external", "the gain replicates under an out-of-family customer and an independent emotion labeller",
         "untested" if not e else ("supported" if sig_pos(e) else "not supported"),
         None if not e else {k: e.get(k) for k in ("delta", "ci95", "p_text", "p_holm")})
@@ -6319,8 +6806,8 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
     add("within_context_validity", "the simulator ranks alternative responses to the SAME context as humans do",
         "untested (needs the human study; EmoWOZ cannot test it)" if not hv else
         ("supported" if hv["ci95"][0] > 0.5 else "not supported"), hv)
-    hc = hs.get("comparisons", {}).get("caro:sft", {}).get("q_satisfaction")
-    add("human_preference", "humans prefer CARO over SFT on customer satisfaction",
+    hc = hs.get("comparisons", {}).get(f"{P}:sft", {}).get("q_satisfaction")
+    add("human_preference", f"humans prefer {NAME} over SFT on customer satisfaction",
         "untested" if not hc else ("supported" if hc["ci95"][0] > 0.5 and hc.get("p_holm", 1) < 0.05 else
                                    "not supported"), hc)
     add("between_context_anchor", "the simulator's outcome for the GOLD response tracks the real customer's "
@@ -6404,6 +6891,15 @@ def stage_claims(cfg: Config) -> Dict[str, Any]:
         add("gain_at_equal_length", "the CARO-SFT gain persists at equal length (regression intercept; descriptive)",
             "supported" if lc["alpha_ci95"][0] > 0 else "not supported",
             {k: lc.get(k) for k in ("raw_delta", "alpha_equal_length", "alpha_ci95", "share_explained_by_length")})
+    runs = [load_json(cfg.out / f"pace_pace_{sd}.json") for sd in cfg.seeds if (cfg.out / f"pace_pace_{sd}.json").exists()]
+    if runs:
+        acc_ = [r["accepted_rounds"] for r in runs]
+        add("pace_no_degradation", "every returned PACE policy passed a high-confidence test of improvement over SFT "
+            "on held-out dev contexts (or is SFT itself)", "supported (by construction; dev, not test)",
+            {"accepted_rounds_per_seed": acc_, "returned_sft": [r["returned_sft"] for r in runs]})
+        add("pace_found_improvement", "PACE found an accepted improvement in every seed",
+            "supported" if all(a > 0 for a in acc_) else f"not supported ({sum(a == 0 for a in acc_)} seeds returned SFT)",
+            {"accepted_rounds_per_seed": acc_})
     add("icc", "the panel estimator's ICC / split-half reliability are evidence of reliability",
         "not supported: they equal 1 by construction for a deterministic estimator (report as n/a)", None)
     dump_json(claims, cfg.out / "claims.json")
@@ -6518,16 +7014,19 @@ def stage_paper(cfg: Config) -> Dict[str, Any]:
         obj.append(["C2': same, PARTIAL on the current turn's human emotion", sv.get("human_label_partial_rho"),
                     "[{:+.3f},{:+.3f}]".format(*sv["human_label_partial_ci_clustered"]), "--",
                     f"carry-over rho={sv.get('human_carryover_rho', float('nan')):+.3f}"])
-    for key_, lab in (("caro_vs_sft:outcome", "C3: delta outcome (simulator)"),
-                      ("caro_vs_sentiment_only:outcome", "C3: vs sentiment-only"),
-                      ("caro_vs_dpo:outcome", "C3: vs DPO"), ("caro_vs_sft_lenmatch:outcome", "C3: vs length-matched SFT"),
-                      ("caro_vs_sft:info_recall", "C3: delta information recall")):
+    P = next((a for a in PRIMARY_ARMS if a in rep["arms"]), "caro")
+    for key_, lab in ((f"{P}_vs_sft:outcome", "C3: delta outcome (simulator)"),
+                      (f"{P}_vs_sentiment_only:outcome", "C3: vs sentiment-only"),
+                      (f"{P}_vs_online_dpo:outcome", "C3: vs online DPO"),
+                      (f"{P}_vs_sft_bon_sim:outcome", "C3: vs best-of-N (same judge)"),
+                      (f"{P}_vs_dpo:outcome", "C3: vs DPO"), (f"{P}_vs_sft_lenmatch:outcome", "C3: vs length-matched SFT"),
+                      (f"{P}_vs_sft:info_recall", "C3: delta information recall")):
         c = rep["contrasts"].get(key_)
         if c:
             obj.append([lab, c["delta"], "[{:+.4f},{:+.4f}]".format(*c["ci95"]), c.get("p_holm", float("nan")),
                         f"d_z={c['cohens_dz']:.3f}"])
-    if ext.get("contrasts", {}).get("caro_vs_sft:outcome"):
-        c = ext["contrasts"]["caro_vs_sft:outcome"]
+    if ext.get("contrasts", {}).get(f"{P}_vs_sft:outcome"):
+        c = ext["contrasts"][f"{P}_vs_sft:outcome"]
         obj.append(["C3: delta outcome (external evaluator)", c["delta"], "[{:+.4f},{:+.4f}]".format(*c["ci95"]),
                     c.get("p_holm", float("nan")), f"d_z={c['cohens_dz']:.3f}"])
     if rw:
@@ -6609,7 +7108,8 @@ def stage_analysis(cfg: Config, with_gpu_ablation: bool = True, with_external: b
         stage_cross_eval(cfg)
     except Exception as e:
         log.error("cross-evaluator agreement skipped: %s", e)
-    stage_ablate_reward(cfg)
+    if (cfg.out / "corpus.npz").exists():
+        stage_ablate_reward(cfg)
     if with_gpu_ablation:
         try:
             stage_ablate_simulator(cfg)
@@ -6639,8 +7139,9 @@ def stage_all(cfg: Config) -> None:
     stage_sft(cfg)
     stage_simulator(cfg)
     stage_validate(cfg)
-    stage_corpus(cfg)
-    stage_reward(cfg)
+    if any(a in NEEDS_REWARD_MODEL for a in cfg.arms):
+        stage_corpus(cfg)
+        stage_reward(cfg)
     if "sft_lenmatch" in cfg.arms and "caro" not in cfg.arms:
         raise ValueError("arm sft_lenmatch needs the caro arm")
     # v14 (D2): every arm, SFT included, is evaluated under every evaluation seed.  v13 evaluated SFT
@@ -6751,6 +7252,17 @@ _FLAGS: List[Tuple[str, str, Any, str]] = [
     ("--external-rollouts", "external_rollouts", int, ""),
     ("--human-contexts", "human_contexts", int, ""), ("--human-validity-pairs", "human_validity_pairs", int, ""),
     ("--noninferiority-info-margin", "noninferiority_info_margin", float, ""),
+    ("--pace-rounds", "pace.rounds", int, "PACE collect/update/accept rounds"),
+    ("--pace-contexts", "pace.contexts_per_round", int, "PACE training contexts per round"),
+    ("--pace-group", "pace.group", int, "PACE on-policy samples per context"),
+    ("--pace-rewrites", "pace.rewrites", int, "PACE content-anchored rewrites per context"),
+    ("--pace-pool-size", "pace.pool_size", int, "simulator replies per context during PACE training"),
+    ("--pace-beta", "pace.beta", float, ""), ("--pace-lr", "pace.lr", float, ""),
+    ("--pace-epochs", "pace.epochs", int, ""), ("--pace-z", "pace.z", float, "noise margin for a preference"),
+    ("--pace-dev-contexts", "pace.dev_contexts", int, "held-out contexts for the acceptance test"),
+    ("--pace-alpha", "pace.alpha", float, "family-wise level of the acceptance tests"),
+    ("--pace-monitor-model", "pace.monitor_model", str, "independent labeller for the acceptance test"),
+    ("--pace-rewriter", "pace.rewriter", str, "base | policy"),
     ("--pool-size", "pool_size", int, "replies per context for the shared-pool estimator"),
     ("--pool-proposals", "pool_proposals", int, "proposal agent turns per reply pool (gold included)"),
     ("--stability-safety", "stability_safety", float, "FIT-half flip limit as a fraction of --max-abs-flip "
@@ -6775,7 +7287,7 @@ def _cfg_set(cfg: Any, path: str, value: Any) -> None:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     d = Config()
-    p = argparse.ArgumentParser(description=f"CARO {VERSION} end-to-end pipeline on EmoWOZ")
+    p = argparse.ArgumentParser(description=f"PACE ({VERSION}) end-to-end pipeline on EmoWOZ")
     p.add_argument("stage", nargs="?", default="all", choices=STAGES)
     for flag, path, typ, hlp in _FLAGS:
         dv = _cfg_get(d, path)
@@ -6975,6 +7487,32 @@ def _unit_tests() -> None:
     assert flips_pool < 0.7 * flips_ind, (flips_pool, flips_ind)
     print(f"unit tests OK | shared-pool estimator: mean {np.mean(est):+.3f} vs truth {truth:+.3f} | replication "
           f"flips {flips_pool}/300 on a shared pool vs {flips_ind}/300 with independent draws")
+    # (11) PACE pair mining: a margin inside the noise is not a preference; a winner that drops information
+    #      is not a winner; the reference reply gets an explicit improvement pair; infeasible replies lose.
+    A = np.array([0.10, 0.30, 0.12, 0.40, 0.35])
+    C11 = np.array([0.8, 0.8, 0.8, 0.2, 0.8])         # candidate 3 has the best affect but drops the information
+    H11 = np.array([True, True, True, True, False])   # candidate 4 is malformed
+    pr = mine_pareto_pairs(A, C11, H11, ref_idx=0, sigma=0.05, z=1.645, eps_c=0.05)
+    assert all(i != 3 or C11[j] - 0.05 <= C11[3] for i, j, _, k in pr if k != "constraint"), pr
+    assert pr[0][:2] == (1, 0) and pr[0][3] == "dominance", pr           # 0.30 vs 0.10 at equal information
+    assert any(k == "constraint" and j == 4 for _, j, _, k in pr), pr
+    wide = mine_pareto_pairs(A, C11, H11, 0, sigma=1.0, z=1.645, eps_c=0.05)
+    assert wide and all(k == "constraint" for *_, k in wide), \
+        f"with noise sd 1 no affect difference is resolved, only constraint pairs may remain: {wide}"
+    assert mine_pareto_pairs(A, C11, H11, 0, 0.05, 1.645, 0.05, pareto=False) == [(3, 0, 1.0, "affect")]
+    # (12) High-confidence acceptance: a real gain is accepted; a gain bought by hacking the training
+    #      labeller (monitor falls) or by dropping information is rejected; noise is rejected.
+    r12 = np.random.default_rng(12)
+    cl12 = np.repeat(np.arange(150), 2)
+    noise = lambda: r12.normal(0, 0.05, 300)
+    good = hcpi_decision(0.03 + noise(), 0.02 + noise(), noise(), np.zeros(300), cl12, 0.05, 0.01, 0.02, 0.02, 0.0, 1)
+    hack = hcpi_decision(0.03 + noise(), -0.03 + noise(), noise(), np.zeros(300), cl12, 0.05, 0.01, 0.02, 0.02, 0.0, 1)
+    info = hcpi_decision(0.03 + noise(), 0.02 + noise(), -0.10 + noise(), np.zeros(300), cl12, 0.05, 0.01, 0.02, 0.02, 0.0, 1)
+    null = hcpi_decision(noise(), noise(), noise(), np.zeros(300), cl12, 0.05, 0.01, 0.02, 0.02, 0.0, 1)
+    assert good["accept"] and not hack["accept"] and not info["accept"] and not null["accept"], \
+        (good["checks"], hack["checks"], info["checks"], null["checks"])
+    print("unit tests OK | PACE: Pareto pair mining and high-confidence acceptance (real gain accepted; labeller "
+          "hacking, information loss and noise rejected)")
     # (9) Stability-constrained temperature: an inadmissible optimum must not be chosen, and an empty
     #     admissible set must fall back to the unconstrained optimum (reported, never silently widened).
     r9 = np.random.default_rng(9)
@@ -7029,8 +7567,9 @@ def run_selftest() -> None:
     make_synthetic_emowoz(data, 420, 0)
     cfg = build_config(parse_args([
         "all", "--stub", "--no-strict", "--data-dir", str(data), "--out", str(root / "run"),
-        "--seeds", "42", "43", "--arms", "sft", "sentiment_only", "dpo", "caro", "caro_no_abstain", "sft_bon_rm",
-        "sft_lenmatch", "--ablate-fit-seeds", "2", "--human-contexts", "40", "--human-validity-pairs", "40",
+        "--seeds", "42", "43", "--arms", *KNOWN_ARMS, "--outcome-mode", "pool", "--pool-size", "16",
+        "--pace-rounds", "2", "--pace-contexts", "24", "--pace-dev-contexts", "60", "--pace-pool-size", "8",
+        "--ablate-fit-seeds", "2", "--human-contexts", "40", "--human-validity-pairs", "40",
         "--n-signflip", "2000", "--reward-n-perm", "200",
         "--sim-rollouts", "4", "--sim-rollouts-corpus", "3",
         "--validate-contexts", "80", "--validate-variants", "4", "--ablate-contexts", "60",
@@ -7042,10 +7581,25 @@ def run_selftest() -> None:
     rep = load_json(cfg.out / "report.json")
     assert rep["arms"], "no arms in report"
     assert set(rep["arms"]) == set(KNOWN_ARMS), f"arms missing from the report: {set(KNOWN_ARMS) - set(rep['arms'])}"
-    for k in ("caro_vs_sentiment_only:outcome", "caro_vs_dpo:outcome", "caro_vs_sft_lenmatch:outcome",
-              "caro_vs_sft:info_recall"):
+    assert cfg.outcome_mode == "pool" or load_json(cfg.out / "outcome_mode.json")["selected"] == "pool"
+    for arm in ("pace", "pace_no_pareto"):
+        for r in load_json(cfg.out / f"pace_{arm}_42.json")["rounds"]:
+            if not r["accepted"]:
+                assert not all(r["checks"].values()), "a round was rolled back although every check passed"
+    for k in ("pace_vs_sentiment_only:outcome", "pace_vs_online_dpo:outcome", "pace_vs_sft_bon_sim:outcome",
+              "pace_vs_pace_no_hcpi:outcome", "pace_vs_caro:outcome", "pace_vs_sft:info_recall"):
         assert k in rep["contrasts"], f"missing contrast {k}"
-    assert "noninferior" in rep["contrasts"]["caro_vs_sft:info_recall"]
+    assert "noninferior" in rep["contrasts"]["pace_vs_sft:info_recall"]
+    for arm in PACE_ARMS:
+        run = load_json(cfg.out / f"pace_{arm}_42.json")
+        assert run["rounds"], f"{arm}: no PACE round ran"
+        assert run["flags"] == pace_flags(arm)
+    pr = load_json(cfg.out / "pace_pace_42.json")
+    assert all("accept" in r and "checks" in r for r in pr["rounds"]), "acceptance test missing from PACE rounds"
+    assert any(r["pairs"] > 0 for r in pr["rounds"]), "PACE mined no preference pairs"
+    assert pace_flags("online_dpo") == {"rewrite": False, "pareto": False, "hcpi": False}
+    claims_ = {c["id"]: c for c in load_json(cfg.out / "claims.json")}
+    assert "pace_no_degradation" in claims_ and "pace_vs_online_dpo:outcome" in claims_
     assert rep["cluster_unit"].startswith("dialogue")
     sft_rows = [load_json(cfg.out / f"eval_sft_{sd}.json") for sd in cfg.seeds]
     assert [r["response"] for r in sft_rows[0]] != [r["response"] for r in sft_rows[1]], \
