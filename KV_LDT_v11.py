@@ -1268,6 +1268,7 @@ class ModelPipeline:
                 g = torch.Generator(device="cpu").manual_seed(s)
                 y_ctrl = y.clone()
                 y_ctrl[tr] = y[tr][torch.randperm(len(tr), generator=g).to(DEVICE)]
+                y_ctrl[va] = y[va][torch.randperm(len(va), generator=g).to(DEVICE)]
                 mu, sd = standardizer(X[tr])
                 Z = (X - mu) / sd
                 for task, yy in (("real", y), ("control", y_ctrl)):
